@@ -237,9 +237,18 @@ def test_malformed_messages_get_standard_errors(stdio_session):
     stdio_session.send("{this is not json")
     assert stdio_session.receive() == {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}
 
-    # Valid JSON but params must be an object or array.
+    # Valid JSON but not a valid JSON-RPC message: the id is echoed when it can be read.
     stdio_session.send('{"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": "wrong"}')
-    assert stdio_session.receive()["error"]["code"] == -32600
+    assert stdio_session.receive() == {"jsonrpc": "2.0", "id": 2, "error": {"code": -32600, "message": "Invalid Request"}}
+
+    stdio_session.send('{"jsonrpc": "1.0", "id": "req-x", "method": "tools/list"}')
+    assert stdio_session.receive()["id"] == "req-x"
+
+    for unusable_id in ['{"jsonrpc": "2.0", "id": true, "method": "tools/list", "params": "x"}', "[1, 2]"]:
+        stdio_session.send(unusable_id)
+        response = stdio_session.receive()
+        assert response["id"] is None
+        assert response["error"]["code"] == -32600
 
     wrong_param_type = stdio_session.request(3, "tools/call", {"name": 5})
     assert wrong_param_type["error"]["code"] == -32602

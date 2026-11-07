@@ -151,9 +151,10 @@ What they cover, briefly:
 - **Task 2**: viewer vs admin, case tricks (`ADMIN_x`), 13 kinds of bad credentials (expired, wrong secret,
   `alg: none`, forged payload, ...), malformed bodies, batches, duplicate-key smuggling, downstream down/timeout,
   SSE passthrough. Every rejection asserts the downstream received nothing.
-- **Task 3**: streaming output equals whole-text redaction for many chunk sizes and 200 random chunkings, PII split
-  at every kind of boundary, bounded buffer on long runs, first output emitted before the provider finishes,
-  SSE format preserved, multiple choices, provider errors.
+- **Task 3**: detection against hand-written expected outputs (including cards and SSNs next to other digits),
+  streaming output equal to whole-text redaction for many chunk sizes, 200 random chunkings and 2,000 seeded
+  adversarial inputs, PII split at every kind of boundary, long-input speed and bounded buffer, first output
+  emitted before the provider finishes, SSE format preserved, multiple choices, provider errors.
 - **Task 4**: window boundaries with a fake clock, eviction from disk, persistence across instances, 40 threads and
   30 concurrent HTTP requests against one budget, fallback on 429/timeout/5xx/network/bad JSON, no fallback on 400,
   both providers failing, and error payloads that never contain upstream details.
@@ -168,7 +169,7 @@ failures into `isError` tool results, and the assessment asks for JSON-RPC error
 Pydantic models are `strict` (no `"10"` → 10 coercion) with `extra="forbid"`. Customer IDs use `[0-9]` instead of
 `\d` because pydantic's regex engine treats `\d` as any Unicode digit. The SDK's stdio transport silently drops
 lines it can't parse; a small filter in front of the server answers those with `-32700`/`-32600` as JSON-RPC
-expects. The SDK also redirects fd 1 to stderr while serving, so even a stray `print` can't corrupt the protocol
+expects, echoing the request id when it can be read. The SDK also redirects fd 1 to stderr while serving, so even a stray `print` can't corrupt the protocol
 stream, but all logging is configured for stderr regardless.
 
 **Task 2.** Tokens are HS256 JWTs with a `role` claim; the signature, `exp`, `sub` and `role` are required and the
@@ -184,8 +185,10 @@ algorithm list is pinned, so the role can't be self-asserted. Other points:
 **Task 3.** `StreamRedactor` keeps a small pending buffer. After each chunk it holds back only the trailing run
 of characters that could still become part of a match: email characters, or digits/spaces/dashes for SSNs and
 cards. Everything before that is redacted and sent immediately, so the extra latency is roughly one word. The
-buffer is capped at 256 characters and the cut never goes through a match. The tests and a 50k-case fuzz run check
-that streaming output is identical to redacting the full text at once, for any chunking. The SSE layer rewrites
+buffer is capped at 256 characters and the cut never goes through a match; every pattern has a maximum length,
+so the buffer stays bounded. Tests check that streaming output is identical to redacting the full text at once,
+including 2,000 seeded adversarial inputs. Digits are matched as whole runs (up to 48 digits) and then checked
+inside, so a card or SSN next to unrelated digits (`4111 1111 1111 1111 12/26`) is still found. The SSE layer rewrites
 only `choices[].delta.content` and keeps the rest of each event as-is; held text is flushed on `finish_reason`,
 `[DONE]`, or end of stream.
 
@@ -194,6 +197,7 @@ only `choices[].delta.content` and keeps the rest of each event as-is; held text
   check-and-insert runs inside `BEGIN IMMEDIATE`, which takes SQLite's write lock up front, so concurrent requests
   (threads or separate processes on the same file) can't both see the same total and both pass. Rows older than
   the window are deleted on every reservation. Tenant keys are stored as SHA-256 prefixes.
+- OpenAI-style requests may include `model`; it is accepted but ignored, since the router picks the provider model.
 - Token accounting: before the call the gateway reserves an estimate, `ceil(prompt_chars / 4) + 4 per message +
   max_tokens` (default `max_tokens` 512). After a successful call the reservation is replaced with the provider's
   `usage.total_tokens`. If every provider fails the reservation is released, so tenants aren't charged for
@@ -218,12 +222,15 @@ only `choices[].delta.content` and keeps the rest of each event as-is; held text
 - **Task 3**: regex detection is pattern matching, not real PII detection. It covers emails, dashed US SSNs
   (`123-45-6789`) and 13-19 digit card numbers (optional single space/dash separators, Luhn-checked). It misses
   SSNs without dashes, obfuscated values (`john at example dot com`), numbers spelled out, PII in other languages
-  or scripts, and anything inside a single run longer than 256 email/number characters. It can over-redact
-  numbers that happen to look like a dashed SSN or pass Luhn. Only response content is redacted, not the
+  or scripts, cards straddling the boundary of a digit run longer than 48 digits, and values inside email-character
+  runs longer than 256 characters. It can over-redact digits next to a card, or numbers that happen to look like
+  a dashed SSN or pass Luhn. Only response content is redacted, not the
   prompt. Assumes OpenAI-style single-line `data:` events.
 - **Task 4**: the token estimate is a heuristic (~4 chars/token), not a real tokenizer. Because the reservation
   includes `max_tokens`, a tenant can get 429s while actual usage is below the limit, until in-flight requests
-  settle. If the provider reports more tokens than reserved, the window can briefly exceed the limit by the
-  difference (later requests are then blocked). If a request is cancelled mid-flight its reservation stays at
+  settle. The estimate is not an upper bound: prompts that tokenize densely (CJK text, emoji, unusual symbols)
+  can use several times more tokens than `chars / 4`, and the tenant controls that. After settlement the window
+  then holds more than the limit; later requests are blocked until it drains, but within that window the limit is
+  exceeded. If a request is cancelled mid-flight its reservation stays at
   the estimate. One SQLite write lock serializes all reservations: fine for a single gateway node, not for a
   horizontally scaled fleet (use Redis or similar there). Only non-streaming completions are routed.

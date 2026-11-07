@@ -147,6 +147,21 @@ server = Server(
 )
 
 
+def request_id_from(error: Exception) -> str | int | None:
+    # For a message that parsed as JSON but isn't valid JSON-RPC, pydantic's "missing field"
+    # errors carry the whole message as their input, so the id can be recovered from there.
+    if not isinstance(error, ValidationError):
+        return None
+    for detail in error.errors():
+        message = detail.get("input")
+        if detail["type"] == "missing" and len(detail["loc"]) == 2 and isinstance(message, dict):
+            request_id = message.get("id")
+            if isinstance(request_id, (str, int)) and not isinstance(request_id, bool):
+                return request_id
+            return None
+    return None
+
+
 async def forward_parseable_messages(transport_read, server_write, transport_write) -> None:
     # The SDK stdio transport passes unparseable lines on as exceptions, which the
     # server ignores. JSON-RPC 2.0 expects an error reply, so answer those here.
@@ -157,13 +172,14 @@ async def forward_parseable_messages(transport_read, server_write, transport_wri
                 continue
 
             is_bad_json = isinstance(item, ValidationError) and item.errors()[0]["type"] == "json_invalid"
-            error = (
-                types.ErrorData(code=types.PARSE_ERROR, message="Parse error")
-                if is_bad_json
-                else types.ErrorData(code=types.INVALID_REQUEST, message="Invalid Request")
-            )
+            if is_bad_json:
+                error = types.ErrorData(code=types.PARSE_ERROR, message="Parse error")
+                request_id = None
+            else:
+                error = types.ErrorData(code=types.INVALID_REQUEST, message="Invalid Request")
+                request_id = request_id_from(item)
             logger.warning("rejected malformed message: %s", error.message)
-            await transport_write.send(SessionMessage(types.JSONRPCError(jsonrpc="2.0", id=None, error=error)))
+            await transport_write.send(SessionMessage(types.JSONRPCError(jsonrpc="2.0", id=request_id, error=error)))
 
 
 async def run() -> None:

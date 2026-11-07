@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 import threading
 import time
@@ -274,6 +275,23 @@ async def test_successful_request_reports_provider_and_settles_usage(db_path):
     assert response.headers["x-gateway-provider"] == "secondary"
     # Reservation (estimate) replaced by the provider's reported total_tokens.
     assert limiter.tokens_used(tenant_id(TENANT_KEY)) == 42
+
+
+async def test_openai_style_model_field_is_accepted_but_gateway_picks_model(db_path):
+    sent_models = []
+
+    def handler(request):
+        sent_models.append(json.loads(request.content)["model"])
+        return httpx.Response(200, json=completion())
+
+    limiter = TokenRateLimiter(db_path)
+    router = ModelRouter(PRIMARY, SECONDARY, httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    app = create_app(limiter, router, {TENANT_KEY})
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gateway") as client:
+        response = await client.post("/v1/chat/completions", json={**PAYLOAD, "model": "gpt-4o"}, headers=AUTH)
+
+    assert response.status_code == 200
+    assert sent_models == ["primary-model"]
 
 
 @pytest.mark.parametrize("headers", [{}, {"Authorization": "Bearer wrong"}, {"Authorization": TENANT_KEY}])

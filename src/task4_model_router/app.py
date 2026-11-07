@@ -27,6 +27,8 @@ class Message(BaseModel):
 class CompletionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # Accepted for OpenAI-client compatibility; the router always sends its own provider model.
+    model: str | None = None
     messages: list[Message] = Field(min_length=1)
     max_tokens: int = Field(default=512, ge=1, le=8192)
     temperature: float | None = Field(default=None, ge=0, le=2)

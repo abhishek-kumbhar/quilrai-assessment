@@ -1,0 +1,40 @@
+[project]
+name = "quillrai-assessment"
+version = "0.1.0"
+description = "MCP server, MCP security gateway, streaming PII guardrail and LLM model router"
+readme = "README.md"
+authors = [
+    { name = "Abhishek Kumbhar", email = "57053104+abhishek-kumbhar@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.162.2",
+    "httpx>=0.28.1",
+    "mcp>=2.3.0",
+    "pydantic>=2.14.3",
+    "pyjwt>=2.15.1",
+    "uvicorn>=0.54.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "src/task1_mcp_server",
+    "src/task2_security_gateway",
+    "src/task3_streaming_guardrail",
+    "src/task4_model_router",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.1.post1",
+]

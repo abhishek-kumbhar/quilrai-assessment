@@ -19,7 +19,7 @@ from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 from mcp.shared.exceptions import MCPError
 from mcp.shared.message import SessionMessage
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError, field_validator
 
 logger = logging.getLogger("task1_mcp_server")
 
@@ -39,6 +39,13 @@ class TriggerRefundInput(BaseModel):
     customer_id: CustomerId
     amount: float = Field(gt=0, allow_inf_nan=False, description="Refund amount, must be positive")
     reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=10, max_length=500)]
+
+    @field_validator("amount")
+    @classmethod
+    def at_most_two_decimals(cls, value: float) -> float:
+        if round(value, 2) != value:
+            raise ValueError("amount must have at most 2 decimal places")
+        return value
 
 
 CUSTOMERS: dict[str, dict[str, Any]] = {

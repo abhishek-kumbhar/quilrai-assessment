@@ -110,7 +110,7 @@ async def test_trigger_refund_accepts_integer_amount():
     assert result.is_error is False
 
 
-@pytest.mark.parametrize("amount", [0, -1, -0.01, "10.00", True, None, math.inf, math.nan, [10]])
+@pytest.mark.parametrize("amount", [0, -1, -0.01, 0.001, 10.005, "10.00", True, None, math.inf, math.nan, [10]])
 async def test_trigger_refund_rejects_invalid_amount(amount):
     error = await call_expecting_protocol_error("trigger_refund", {**VALID_REFUND, "amount": amount})
     assert error.data[0]["field"] == "amount"
@@ -188,6 +188,9 @@ def stdio_session():
     yield session
     if session.process.poll() is None:
         session.process.kill()
+    session.process.wait(timeout=10)
+    for pipe in (session.process.stdin, session.process.stdout, session.process.stderr):
+        pipe.close()
 
 
 def test_stdio_wire_protocol_and_error_mapping(stdio_session):

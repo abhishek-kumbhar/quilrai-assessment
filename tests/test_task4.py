@@ -2,6 +2,7 @@ import asyncio
 import sqlite3
 import threading
 import time
+from contextlib import closing
 
 import httpx
 import pytest
@@ -78,7 +79,8 @@ def test_expired_rows_are_evicted_from_disk(db_path):
     clock.now += 61
     limiter.reserve("t1", 500)
 
-    rows = sqlite3.connect(db_path).execute("SELECT tenant, tokens FROM token_usage").fetchall()
+    with closing(sqlite3.connect(db_path)) as conn:
+        rows = conn.execute("SELECT tenant, tokens FROM token_usage").fetchall()
     assert rows == [("t1", 500)]
 
 

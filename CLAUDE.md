@@ -1,6 +1,6 @@
 # Project conventions
 
-- One uv project, `src/` layout, one package per task: `task1_mcp_server`, `task2_security_gateway`,
+- Python >=3.12 (no .python-version pinned). One uv project, `src/` layout, one package per task: `task1_mcp_server`, `task2_security_gateway`,
   `task3_streaming_guardrail`, `task4_model_router`. Each runs with `uv run python -m <package>`.
 - Tests: `uv run pytest` (pytest-asyncio in auto mode). One test file per task. No network or paid API keys;
   upstreams are mocked with `httpx.MockTransport` or in-repo mock apps.

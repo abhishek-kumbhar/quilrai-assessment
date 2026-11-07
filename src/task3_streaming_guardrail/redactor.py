@@ -10,16 +10,21 @@ import string
 
 REDACTED = "[REDACTED]"
 
-EMAIL = r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}"
+# Length limits (local part 64, labels 63) keep matching linear on long runs of letters
+# and bound how long a single match can get.
+EMAIL = r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,63}"
 # [0-9] instead of \d so non-ASCII digits don't widen the match.
 SSN = r"(?<![0-9])[0-9]{3}-[0-9]{2}-[0-9]{4}(?![0-9])"
-CARD = r"(?<![0-9])[0-9](?:[ -]?[0-9]){12,18}(?![0-9])"
-PII_PATTERN = re.compile(f"(?P<email>{EMAIL})|(?P<ssn>{SSN})|(?P<card>{CARD})")
+# A whole run of 13-48 digits with optional single space/dash separators. Matching the
+# full run (not just 13-19 digits) lets redact_digit_run find a card or SSN inside it.
+DIGIT_RUN = r"(?<![0-9])[0-9](?:[ -]?[0-9]){12,47}(?![0-9])"
+PII_PATTERN = re.compile(f"(?P<email>{EMAIL})|(?P<ssn>{SSN})|(?P<digits>{DIGIT_RUN})")
+SSN_PATTERN = re.compile(SSN)
 
 EMAIL_CHARS = frozenset(string.ascii_letters + string.digits + "._%+-@")
 NUMBER_CHARS = frozenset(string.digits + " -")
 
-# Longest valid email is 254 chars; cards with separators are under 40.
+# Longest valid email is 254 chars; a digit run match is at most 95.
 MAX_HOLDBACK = 256
 
 
@@ -33,12 +38,37 @@ def luhn_valid(digits: str) -> bool:
     return total % 10 == 0
 
 
+def redact_digit_run(run: str) -> str:
+    # A card or SSN can sit next to unrelated digits, e.g. "4111 1111 1111 1111 12/26" or
+    # "555 123 4567 123-45-6789". Redact every SSN and every sequence of whole digit groups
+    # that forms a Luhn-valid 13-19 digit card; other digits (order IDs, phones) stay.
+    sensitive = [match.span() for match in SSN_PATTERN.finditer(run)]
+    groups = [match.span() for match in re.finditer(r"[0-9]+", run)]
+    for first in range(len(groups)):
+        digits = ""
+        for start, end in groups[first:]:
+            digits += run[start:end]
+            if len(digits) > 19:
+                break
+            if len(digits) >= 13 and luhn_valid(digits):
+                sensitive.append((groups[first][0], end))
+
+    masked = [False] * len(run)
+    for start, end in sensitive:
+        masked[start:end] = [True] * (end - start)
+
+    output = []
+    for index, char in enumerate(run):
+        if not masked[index]:
+            output.append(char)
+        elif index == 0 or not masked[index - 1]:
+            output.append(REDACTED)
+    return "".join(output)
+
+
 def replacement(match: re.Match) -> str:
-    # Long digit runs (order IDs, timestamps) are only treated as cards if the Luhn check passes.
-    if match.lastgroup == "card":
-        digits = re.sub(r"[ -]", "", match.group())
-        if not luhn_valid(digits):
-            return match.group()
+    if match.lastgroup == "digits":
+        return redact_digit_run(match.group())
     return REDACTED
 
 

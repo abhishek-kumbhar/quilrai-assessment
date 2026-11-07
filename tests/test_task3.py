@@ -1,6 +1,7 @@
 import asyncio
 import json
 import random
+import time
 
 import httpx
 import pytest
@@ -51,6 +52,39 @@ def test_luhn_filters_random_long_numbers():
     assert redact_text("id 4111111111111112") == "id 4111111111111112"
 
 
+PII_NEXT_TO_DIGITS = [
+    ("Card 4111 1111 1111 1111 12/26", "Card [REDACTED] 12/26"),
+    ("Card 4111 1111 1111 1111 123", "Card [REDACTED] 123"),
+    ("Ref 12 4111 1111 1111 1111", "Ref 12 [REDACTED]"),
+    ("Phone 555 123 4567 123-45-6789", "Phone 555 123 4567 [REDACTED]"),
+    ("Codes 1 2 3 4 123-45-6789", "Codes 1 2 3 4 [REDACTED]"),
+    ("Ext 12 34 123-45-6789", "Ext 12 34 [REDACTED]"),
+    ("4111 1111 1111 1111 123-45-6789", "[REDACTED] [REDACTED]"),
+    ("amex 3782 822463 10005 exp 0127", "amex [REDACTED] exp 0127"),
+    ("Pay with 4111111111111111 or 5500-0000-0000-0004 now", "Pay with [REDACTED] or [REDACTED] now"),
+    ("Dates 2024 01 15 2024 02 20, call 555 123 4567", "Dates 2024 01 15 2024 02 20, call 555 123 4567"),
+]
+
+
+@pytest.mark.parametrize("text, expected", PII_NEXT_TO_DIGITS)
+def test_pii_next_to_other_digits(text, expected):
+    assert redact_text(text) == expected
+
+
+@pytest.mark.parametrize("text, expected", PII_NEXT_TO_DIGITS)
+@pytest.mark.parametrize("chunk_size", [1, 3, 7])
+def test_pii_next_to_other_digits_when_streamed(text, expected, chunk_size):
+    assert stream_through(text, split_every(text, chunk_size)) == expected
+
+
+def test_card_at_end_of_long_digit_run_is_redacted():
+    # 23 digits in total; the card is the last four groups. Extra digits may be redacted too.
+    output = redact_text("Codes 1 2 3 4 5 6 7 4111 1111 1111 1111 done")
+    assert output.startswith("Codes 1 2 ")
+    assert output.endswith("[REDACTED] done")
+    assert "4111" not in output and "1111" not in output
+
+
 @pytest.mark.parametrize("text", SAMPLES)
 @pytest.mark.parametrize("chunk_size", [1, 2, 3, 5, 7, 16, 1000])
 def test_streaming_matches_whole_text_redaction(text, chunk_size):
@@ -69,6 +103,39 @@ def test_random_chunk_boundaries_match_whole_text_redaction(seed):
         chunks.append(text[position : position + size])
         position += size
     assert stream_through(text, chunks) == redact_text(text)
+
+
+def test_adversarial_inputs_stream_the_same_as_whole_text():
+    # Glued tokens with no separators, stray @ and -, PII next to digits, non-ASCII digits.
+    tokens = ["a", "Z", "0", "7", "-", " ", ".", "@", "_", "+", "x@y.co", "123-45-6789", "4111 1111 1111 1111",
+              "4111111111111111", "b@c.org", "\n", ",", "foo", "99", "4242-4242-4242-4242", "é", "١", "12/26",
+              "555 123 4567"]
+    failures = []
+    for seed in range(2000):
+        rng = random.Random(seed)
+        text = rng.choice(["", " "]).join(rng.choice(tokens) for _ in range(rng.randint(1, 25)))
+        chunks, position = [], 0
+        while position < len(text):
+            size = rng.randint(1, 8)
+            chunks.append(text[position : position + size])
+            position += size
+        if stream_through(text, chunks) != redact_text(text):
+            failures.append((seed, text))
+    assert failures == []
+
+
+def test_long_inputs_stay_fast_and_bounded():
+    started = time.perf_counter()
+    redact_text("a" * 200_000)
+    redact_text("x@" + "ab." * 50_000)
+    redact_text("4 " * 50_000)
+    assert time.perf_counter() - started < 1.0
+
+    # Email-like run that never ends: the buffer must not grow with it.
+    redactor = StreamRedactor()
+    for chunk in split_every("x@" + "ab." * 20_000, 5):
+        redactor.feed(chunk)
+        assert len(redactor.pending) <= 1_000
 
 
 @pytest.mark.parametrize(

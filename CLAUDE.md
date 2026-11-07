@@ -20,7 +20,8 @@
   well-formed requests use HTTP 200; auth failures 401; bad envelopes 400; downstream failures 502/504.
 - Task 3 `StreamRedactor` holds back only the trailing run of chars that could still extend a match
   (email chars, or digits/space/dash), capped at 256, and never cuts through a match. Invariant tested by fuzz:
-  streaming output == `redact_text(full_text)` for any chunking. Cards require a Luhn pass.
+  streaming output == `redact_text(full_text)` for any chunking. Digits are matched as whole runs (13-48 digits);
+  `redact_digit_run` redacts SSNs and Luhn-valid 13-19 digit group sequences inside them. Every pattern has a max length.
 - Task 4 limiter is a sliding log in SQLite (`token_usage` rows), check+insert inside `BEGIN IMMEDIATE`,
   connection per operation (run via `asyncio.to_thread`). Reserve estimate (chars/4 + 4/message + max_tokens),
   settle to provider `usage.total_tokens`, release if every provider fails. Tenant stored as sha256 prefix of key.

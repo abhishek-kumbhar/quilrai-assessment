@@ -14,3 +14,7 @@
   instead of `isError` tool results. Business failures (unknown customer, refund above balance) are `isError` results.
   Customer IDs are `CUST-` + 5 ASCII digits (`[0-9]`, not `\d`, which matches Unicode digits in pydantic).
 - SDK stdio transport drops unparseable lines; `forward_parseable_messages` answers them with -32700/-32600.
+- Task 2 tokens are HS256 JWTs (`role` claim, `exp`/`sub` required, algorithms pinned). Gateway forwards the
+  re-serialized parsed message (prevents duplicate-key parser differentials), never forwards the caller's
+  Authorization header, rejects batches, and matches `admin_` case-insensitively. JSON-RPC errors for
+  well-formed requests use HTTP 200; auth failures 401; bad envelopes 400; downstream failures 502/504.

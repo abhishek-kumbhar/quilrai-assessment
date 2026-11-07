@@ -18,3 +18,6 @@
   re-serialized parsed message (prevents duplicate-key parser differentials), never forwards the caller's
   Authorization header, rejects batches, and matches `admin_` case-insensitively. JSON-RPC errors for
   well-formed requests use HTTP 200; auth failures 401; bad envelopes 400; downstream failures 502/504.
+- Task 3 `StreamRedactor` holds back only the trailing run of chars that could still extend a match
+  (email chars, or digits/space/dash), capped at 256, and never cuts through a match. Invariant tested by fuzz:
+  streaming output == `redact_text(full_text)` for any chunking. Cards require a Luhn pass.

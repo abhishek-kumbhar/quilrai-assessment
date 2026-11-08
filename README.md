@@ -148,9 +148,10 @@ What they cover, briefly:
 - **Task 1**: valid calls, a table of bad customer IDs / amounts / reasons, missing and extra fields, unknown tool,
   `isError` vs JSON-RPC error, a raw subprocess session asserting every stdout line is JSON-RPC and logs land on
   stderr, -32700 for unparseable input, and the official SDK client talking to the server.
-- **Task 2**: viewer vs admin, case tricks (`ADMIN_x`), 13 kinds of bad credentials (expired, wrong secret,
-  `alg: none`, forged payload, ...), malformed bodies, batches, duplicate-key smuggling, downstream down/timeout,
-  SSE passthrough. Every rejection asserts the downstream received nothing.
+- **Task 2**: viewer vs admin, case tricks (`ADMIN_x`), 18 kinds of bad credentials (expired, wrong secret,
+  `alg: none`, forged payload, non-string role, ...), malformed bodies and envelopes (bad id types, non-object
+  params, `result` and `error` together), batches, duplicate-key smuggling, oversized streamed bodies, downstream
+  down/timeout/broken mid-stream, SSE passthrough. Every rejection asserts the downstream received nothing.
 - **Task 3**: detection against hand-written expected outputs (including cards and SSNs next to other digits),
   streaming output equal to whole-text redaction for many chunk sizes, 200 random chunkings and 2,000 seeded
   adversarial inputs, PII split at every kind of boundary, long-input speed and bounded buffer, first output
@@ -180,6 +181,11 @@ algorithm list is pinned, so the role can't be self-asserted. Other points:
   keys could be read one way by the gateway and another way by the downstream.
 - Batches are rejected (MCP no longer supports them) so an admin call can't hide inside an array.
 - `admin_` is matched case-insensitively after trimming whitespace.
+- The envelope is checked before anything is forwarded: `jsonrpc` is `"2.0"`, ids are strings or integers,
+  `params` is an object, and client responses carry exactly one of `result`/`error`. The 1 MB body limit is
+  enforced while reading, so an oversized body is cut off rather than buffered.
+- The downstream response is streamed through and always closed. If it breaks after headers were sent, the
+  client connection is aborted rather than ended as if the body were complete.
 - The caller's `Authorization` header is not forwarded downstream (no token passthrough).
 - HTTP status: 401 for bad credentials, 400 for unparseable/invalid JSON-RPC, 200 with a JSON-RPC error for
   `-32001`/`-32602` (so MCP clients match it to the request id), 502/504 if the downstream is unreachable.

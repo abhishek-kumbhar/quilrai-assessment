@@ -44,7 +44,7 @@ def caller_from_authorization(header: str | None, secret: str) -> Caller:
     except jwt.PyJWTError:
         raise AuthError("Invalid or expired token") from None
 
-    if claims["role"] not in ROLES:
+    if not isinstance(claims["role"], str) or claims["role"] not in ROLES:
         raise AuthError("Invalid or expired token")
     return Caller(subject=str(claims["sub"]), role=claims["role"])
 

@@ -118,6 +118,10 @@ MISSING_ROLE = jwt.encode({"sub": "bob", "exp": int(time.time()) + 60}, SECRET, 
 UNSIGNED = jwt.encode({"sub": "bob", "role": "admin", "exp": int(time.time()) + 60}, None, algorithm="none")
 
 
+def signed_role(role):
+    return jwt.encode({"sub": "bob", "role": role, "exp": int(time.time()) + 60}, SECRET, algorithm="HS256")
+
+
 def forged_role_token():
     # Swap a viewer token's payload for an admin one while keeping the original signature.
     header, _, signature = issue_token("bob", "viewer", SECRET).split(".")
@@ -141,6 +145,12 @@ def forged_role_token():
         bearer(MISSING_ROLE),
         bearer(UNSIGNED),
         bearer(forged_role_token()),
+        # Correctly signed, but the role claim has the wrong type: still a clean 401, not a 500.
+        bearer(signed_role([])),
+        bearer(signed_role({})),
+        bearer(signed_role(["admin"])),
+        bearer(signed_role(1)),
+        bearer(signed_role(None)),
     ],
 )
 async def test_invalid_credentials_are_rejected_before_forwarding(client, downstream, headers):
@@ -168,7 +178,6 @@ async def test_bearer_scheme_is_case_insensitive(client):
         (b'{"jsonrpc": "2.0", "id": 1, "method": 5}', 400, -32600),
         (b'{"jsonrpc": "2.0", "id": 1, "method": "tools/call"}', 200, -32602),
         (b'{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": 5}}', 200, -32602),
-        (b'{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": ["admin_reset_key"]}', 200, -32602),
     ],
 )
 async def test_malformed_requests(client, downstream, body, status, code):
@@ -177,6 +186,75 @@ async def test_malformed_requests(client, downstream, body, status, code):
     assert response.status_code == status
     assert response.json()["error"]["code"] == code
     assert downstream.requests == []
+
+
+@pytest.mark.parametrize(
+    "message, echoed_id",
+    [
+        ({"jsonrpc": "2.0", "id": [], "method": "tools/list"}, None),
+        ({"jsonrpc": "2.0", "id": True, "method": "tools/list"}, None),
+        ({"jsonrpc": "2.0", "id": None, "method": "tools/list"}, None),
+        ({"jsonrpc": "2.0", "id": 1.5, "method": "tools/list"}, None),
+        ({"jsonrpc": "2.0", "id": {"a": 1}, "method": "tools/list"}, None),
+        ({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": "x"}, 3),
+        ({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": ["admin_reset_key"]}, 3),
+        ({"jsonrpc": "2.0", "method": "notifications/initialized", "params": 1}, None),
+        ({"jsonrpc": "2.0", "id": 3, "method": "tools/list", "result": {}}, 3),
+        ({"jsonrpc": "2.0", "id": 3, "result": {}, "error": {"code": 1, "message": "m"}}, 3),
+        ({"jsonrpc": "2.0", "id": 3}, 3),
+        ({"jsonrpc": "2.0", "result": {}}, None),
+        ({"jsonrpc": "2.0", "id": "s", "error": "boom"}, "s"),
+        ({"jsonrpc": "2.0", "id": "s", "error": {"code": "1", "message": "m"}}, "s"),
+        ({"jsonrpc": "2.0", "id": "s", "error": {"code": True, "message": "m"}}, "s"),
+        ({"jsonrpc": "2.0", "id": "s", "error": {"code": 1}}, "s"),
+    ],
+)
+async def test_invalid_envelopes_are_rejected_before_forwarding(client, downstream, message, echoed_id):
+    response = await client.post("/mcp", json=message, headers=ADMIN)
+
+    assert response.status_code == 400
+    assert response.json() == {"jsonrpc": "2.0", "id": echoed_id, "error": {"code": -32600, "message": "Invalid Request"}}
+    assert downstream.requests == []
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"jsonrpc": "2.0", "id": "abc", "method": "tools/list"},
+        {"jsonrpc": "2.0", "id": 0, "method": "tools/list", "params": {}},
+        {"jsonrpc": "2.0", "id": -1, "method": "ping"},
+        {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 1}},
+        {"jsonrpc": "2.0", "id": "srv-1", "result": {}},
+        {"jsonrpc": "2.0", "id": 7, "error": {"code": -32603, "message": "client failed", "data": [1]}},
+    ],
+)
+async def test_valid_envelopes_are_forwarded(client, downstream, message):
+    downstream.handler = lambda request: httpx.Response(202)
+    assert (await client.post("/mcp", json=message, headers=VIEWER)).status_code == 202
+    assert downstream.received_messages() == [message]
+
+
+async def test_oversized_body_is_rejected_without_reading_all_of_it(client, downstream):
+    chunks_read = []
+
+    async def body():
+        for index in range(4):
+            chunks_read.append(index)
+            yield b" " * 600_000
+
+    response = await client.post("/mcp", content=body(), headers=VIEWER)
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == -32600
+    assert chunks_read == [0, 1]  # stopped once 1,200,000 bytes passed the 1,000,000 limit
+    assert downstream.requests == []
+
+
+async def test_body_at_the_limit_is_accepted(client, downstream):
+    message = json.dumps(rpc("tools/list")).encode()
+    body = message + b" " * (1_000_000 - len(message))
+    response = await client.post("/mcp", content=body, headers=VIEWER)
+    assert response.status_code == 200
 
 
 async def test_batch_requests_are_rejected_so_admin_calls_cannot_hide_inside(client, downstream):
@@ -237,6 +315,42 @@ async def test_downstream_error_responses_pass_through_unchanged(downstream):
     async with gateway_client(httpx.MockTransport(downstream)) as client:
         response = await client.post("/mcp", json=rpc("tools/list"), headers=VIEWER)
     assert response.status_code == 500
+
+
+async def test_upstream_response_is_closed_when_its_stream_fails():
+    closed = []
+
+    class FailingStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'{"jsonrpc": "2.0", '
+            raise httpx.ReadError("connection reset")
+
+        async def aclose(self):
+            closed.append(True)
+
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, stream=FailingStream()))
+    async with gateway_client(transport) as client:
+        # Headers are already sent, so the failure surfaces as a broken response, not a clean body.
+        with pytest.raises(httpx.ReadError):
+            await client.post("/mcp", json=rpc("tools/list"), headers=VIEWER)
+    assert closed == [True]
+
+
+async def test_upstream_response_is_closed_after_success(downstream):
+    closed = []
+
+    class Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'{"jsonrpc": "2.0", "id": 1, "result": {}}'
+
+        async def aclose(self):
+            closed.append(True)
+
+    downstream.handler = lambda request: httpx.Response(200, stream=Stream())
+    async with gateway_client(httpx.MockTransport(downstream)) as client:
+        response = await client.post("/mcp", json=rpc("tools/list"), headers=VIEWER)
+    assert response.json() == {"jsonrpc": "2.0", "id": 1, "result": {}}
+    assert closed == [True]
 
 
 async def test_sse_responses_and_session_headers_pass_through(downstream):

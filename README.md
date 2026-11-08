@@ -151,15 +151,16 @@ What they cover, briefly:
 - **Task 2**: viewer vs admin, case tricks (`ADMIN_x`), 18 kinds of bad credentials (expired, wrong secret,
   `alg: none`, forged payload, non-string role, ...), malformed bodies and envelopes (bad id types, non-object
   params, `result` and `error` together), `NaN`/`Infinity`/`1e999`, batches, duplicate-key smuggling, oversized
-  streamed bodies, downstream down/timeout/broken mid-stream, client disconnects, SSE passthrough, and which HTTP
+  streamed bodies, downstream down/timeout/broken mid-stream, the client lost while headers or body are sent
+  (disconnect, broken pipe, cancellation), SSE passthrough, and which HTTP
   client the app closes. Every rejection asserts the downstream received nothing.
 - **Task 3**: detection against hand-written expected outputs (including cards and SSNs next to other digits),
   streaming output equal to whole-text redaction for many chunk sizes, 200 random chunkings and 2,000 seeded
   adversarial inputs, PII split at every kind of boundary, long-input speed and bounded buffer, first output
   emitted before the provider finishes, SSE format preserved, multiple choices, provider errors, RFC 5322 email
-  local parts, the documented buffer bound, `logprobs`/refusals/tool calls/extra metadata/SSE comments never
-  reaching the client, malformed provider events, streams that end without `finish_reason` or `[DONE]`, and the
-  provider response being closed on every exit path, including a client disconnect.
+  local parts, the documented buffer bound, `logprobs`/refusals/tool calls/extra metadata/numeric metadata/SSE
+  comments never reaching the client, malformed provider events, streams that end without `finish_reason` or
+  `[DONE]`, and the provider response being closed on every exit path, including the ways a client can be lost.
 - **Task 4**: window boundaries with a fake clock, eviction from disk, persistence across instances, 40 threads and
   30 concurrent HTTP requests against one budget, admission time taken after a held SQLite lock is released,
   provider usage that is a bool/float/string/negative/huge or above the budget (also after the budget is raised),
@@ -195,9 +196,10 @@ algorithm list is pinned, so the role can't be self-asserted. Other points:
   `params` is an object, and client responses carry exactly one of `result`/`error`. The 1 MB body limit is
   enforced while reading, so an oversized body is cut off rather than buffered.
 - The downstream response is streamed through and closed however it ends. If it breaks after headers were sent,
-  the client connection is aborted rather than ended as if the body were complete. A client disconnect cancels the
-  stream, so the close is shielded from that cancellation (and bounded at 5s), and a response stopped between
-  chunks is closed explicitly rather than left to garbage collection.
+  the client connection is aborted rather than ended as if the body were complete. The close is in a `finally` around
+  the whole response send (a small `StreamingResponse` subclass), not in the body generator, so it also runs when the
+  client is lost before the body starts or a send raises `BrokenPipeError`. A disconnect arrives as cancellation,
+  so the close is shielded from it, and bounded at 5s.
 - The HTTP client the app creates is closed on shutdown, also when startup fails; an injected one is left to its owner.
 - The caller's `Authorization` header is not forwarded downstream (no token passthrough).
 - HTTP status: 401 for bad credentials, 400 for unparseable/invalid JSON-RPC, 200 with a JSON-RPC error for
@@ -217,16 +219,17 @@ Markdown around an address (`**bob@x.com**`) is kept.
 The SSE layer rebuilds each event rather than filtering it. Per choice it keeps `index`, `finish_reason` and a
 `delta` with the redacted `content` (plus `role` if it is `assistant`). At the top level it keeps `id`, `object`,
 `model` and `system_fingerprint` if they are strings (redacted as well, since a provider could echo text into any of
-them), `created` if it is an integer, and the integer counts in `usage`. Everything else is dropped: `logprobs`,
-tool calls, refusals, audio, nested or unknown fields, and SSE comments and `id:`/`event:` lines. Those can repeat
-the generated text in a form that isn't redacted (`logprobs` byte arrays would spell out a redacted email). The
-non-streaming path rebuilds `message` the same way. A choice with a non-integer `index`, an unknown
-`finish_reason`, or content that isn't a string is treated as malformed.
+them). Everything else is dropped: `logprobs`, tool calls, refusals, audio, nested or unknown fields, and SSE
+comments and `id:`/`event:` lines. Those can repeat the generated text in a form that isn't redacted (`logprobs`
+byte arrays would spell out a redacted email). Numeric metadata (`usage`, `created`) is dropped too: a card number
+or SSN written as an integer can't be redacted like text, and the task doesn't need those fields. The non-streaming
+path rebuilds `message` the same way. A choice whose `index` isn't an integer from 0 to 127 (OpenAI's limit on
+`n`), with an unknown `finish_reason`, or with content that isn't a string is treated as malformed.
 
 Held text is flushed when a choice gets a `finish_reason` or the provider sends `[DONE]`. A body that just ends
 without either is treated as incomplete, the same as a broken connection or a malformed event: the stream ends with
 a sanitized error event and the held tail is dropped, because it may be the first half of an email that will never
-complete. The provider response is closed however the stream ends, including a client disconnect (as in Task 2).
+complete. The provider response is closed however the stream ends, the same way as in Task 2.
 
 **Task 4.**
 - Rate limiter is a sliding log: one SQLite row per request (`tenant`, `tokens`, `created_at`). The
@@ -275,9 +278,9 @@ complete. The provider response is closed however the stream ends, including a c
   characters glued to the front of an email (`x=bob@x.com` loses `x=`). Only response text is passed through:
   clients asking for `logprobs` or tools get none back. A provider that never sends `finish_reason` or `[DONE]`
   always ends with an error, and a `finish_reason` newer than the ones listed counts as malformed. The prompt isn't
-  redacted. Assumes OpenAI-style
-  single-line `data:` events; the 1,407-char bound is per choice, and the size of a single provider event line
-  and the number of choices aren't capped.
+  redacted. Clients get no `usage` or `created` from the provider. Assumes OpenAI-style single-line `data:`
+  events; the 1,407-char bound is per choice (at most 128 choices), and the size of a single provider event line
+  isn't capped.
 - **Task 4**: the byte estimate is deliberately pessimistic, not a real tokenizer. English prompts reserve about
   4x their real token count (CJK about 2-3x) until the request settles, so a tenant can get 429s while actual usage
   is below the limit, and a request whose byte estimate exceeds the whole budget is rejected with 400 even if its

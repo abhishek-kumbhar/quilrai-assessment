@@ -11,6 +11,7 @@ import json
 import logging
 import sys
 import uuid
+from decimal import Decimal
 from typing import Annotated, Any
 
 import anyio
@@ -19,7 +20,7 @@ from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 from mcp.shared.exceptions import MCPError
 from mcp.shared.message import SessionMessage
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
 logger = logging.getLogger("task1_mcp_server")
 
@@ -38,14 +39,8 @@ class TriggerRefundInput(BaseModel):
 
     customer_id: CustomerId
     amount: float = Field(gt=0, allow_inf_nan=False, description="Refund amount, must be positive")
-    reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=10, max_length=500)]
-
-    @field_validator("amount")
-    @classmethod
-    def at_most_two_decimals(cls, value: float) -> float:
-        if round(value, 2) != value:
-            raise ValueError("amount must have at most 2 decimal places")
-        return value
+    # Surrounding whitespace doesn't count towards the 10 characters.
+    reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=10)]
 
 
 CUSTOMERS: dict[str, dict[str, Any]] = {
@@ -66,16 +61,16 @@ def trigger_refund(args: TriggerRefundInput) -> types.CallToolResult:
     record = CUSTOMERS.get(args.customer_id)
     if record is None:
         return tool_error(f"Customer {args.customer_id} not found")
-    if args.amount > record["refundable_balance"]:
-        return tool_error(
-            f"Refund of {args.amount:.2f} exceeds refundable balance of {record['refundable_balance']:.2f}"
-        )
+    balance = record["refundable_balance"]
+    if args.amount > balance:
+        return tool_error(f"Refund of {args.amount} exceeds refundable balance of {balance}")
 
-    record["refundable_balance"] = round(record["refundable_balance"] - args.amount, 2)
+    # Subtract the decimal values as written, so 75.5 - 0.1 leaves 75.4 rather than 75.39999999999999.
+    record["refundable_balance"] = float(Decimal(str(balance)) - Decimal(str(args.amount)))
     refund = {
         "refund_id": f"RF-{uuid.uuid4().hex[:10]}",
         "customer_id": args.customer_id,
-        "amount": round(args.amount, 2),
+        "amount": args.amount,
         "reason": args.reason,
         "status": "processed",
     }

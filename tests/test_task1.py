@@ -110,7 +110,26 @@ async def test_trigger_refund_accepts_integer_amount():
     assert result.is_error is False
 
 
-@pytest.mark.parametrize("amount", [0, -1, -0.01, 0.001, 10.005, "10.00", True, None, math.inf, math.nan, [10]])
+@pytest.mark.parametrize(
+    "amount, balance_after",
+    [(0.001, 499.999), (10.005, 489.995), (0.1, 499.9), (1e-9, 499.999999999), (500, 0.0)],
+)
+async def test_any_positive_float_up_to_the_balance_is_refunded_exactly(amount, balance_after):
+    # The assessment only asks for a positive float; no hidden 2-decimal rule, no silent rounding.
+    result = await call("trigger_refund", {**VALID_REFUND, "amount": amount})
+
+    assert result.is_error is False
+    assert result.structured_content["amount"] == amount
+    assert server.CUSTOMERS["CUST-00001"]["refundable_balance"] == balance_after
+
+
+async def test_reason_has_a_minimum_length_but_no_maximum():
+    result = await call("trigger_refund", {**VALID_REFUND, "reason": "x" * 5000})
+    assert result.is_error is False
+    assert result.structured_content["reason"] == "x" * 5000
+
+
+@pytest.mark.parametrize("amount", [0, -1, -0.01, -1e-9, "10.00", True, None, math.inf, math.nan, [10]])
 async def test_trigger_refund_rejects_invalid_amount(amount):
     error = await call_expecting_protocol_error("trigger_refund", {**VALID_REFUND, "amount": amount})
     assert error.data[0]["field"] == "amount"

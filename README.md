@@ -166,7 +166,9 @@ failures into `isError` tool results, and the assessment asks for JSON-RPC error
 - invalid arguments or unknown tool → JSON-RPC `-32602 Invalid params` with per-field details;
 - valid request but the operation fails (unknown customer, refund above balance) → `result.isError = true`.
 
-Pydantic models are `strict` (no `"10"` → 10 coercion) with `extra="forbid"`. Customer IDs use `[0-9]` instead of
+Pydantic models are `strict` (no `"10"` → 10 coercion) with `extra="forbid"`. The refund rules are exactly the
+assessment's: `amount` is any finite positive number and `reason` has at least 10 characters, not counting surrounding
+whitespace (so 20 spaces isn't a reason). Customer IDs use `[0-9]` instead of
 `\d` because pydantic's regex engine treats `\d` as any Unicode digit. The SDK's stdio transport silently drops
 lines it can't parse; a small filter in front of the server answers those with `-32700`/`-32600` as JSON-RPC
 expects, echoing the request id when it can be read. The SDK also redirects fd 1 to stderr while serving, so even a stray `print` can't corrupt the protocol

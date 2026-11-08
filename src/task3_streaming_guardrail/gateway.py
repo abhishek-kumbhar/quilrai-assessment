@@ -34,23 +34,27 @@ def sse_event(payload: dict | str) -> bytes:
     return f"data: {data}\n\n".encode()
 
 
+class MalformedResponse(ValueError):
+    """Provider output that doesn't have the shape the redaction relies on."""
+
+
 def checked_choices(body: Any, part: str) -> list[dict]:
-    """Return body["choices"] if every choice has a shape we can redact, else raise ValueError.
+    """Return body["choices"] if every choice has a shape we can redact, else raise MalformedResponse.
 
     `part` is "delta" for stream events and "message" for full completions.
     """
     choices = body.get("choices") if isinstance(body, dict) else None
     if not isinstance(choices, list):
-        raise ValueError("missing choices")
+        raise MalformedResponse("missing choices")
     for choice in choices:
         if not isinstance(choice, dict) or type(choice.get("index", 0)) is not int:
-            raise ValueError("bad choice")
+            raise MalformedResponse("bad choice")
         holder = choice.get(part)
         content = holder.get("content") if isinstance(holder, dict) else None
         if (holder is not None and not isinstance(holder, dict)) or not isinstance(content, str | None):
-            raise ValueError("bad content")
+            raise MalformedResponse("bad content")
         if not isinstance(choice.get("finish_reason"), str | None):
-            raise ValueError("bad finish_reason")
+            raise MalformedResponse("bad finish_reason")
     return choices
 
 

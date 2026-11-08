@@ -2,7 +2,7 @@
 
 Emits text as soon as it can no longer be part of a PII match. Only the trailing run of
 characters that could still grow into a match (email characters, or digits/spaces/dashes)
-is held back, so latency is roughly one word and memory stays bounded.
+is held back, so latency is roughly one word and memory stays bounded (see MAX_HOLDBACK).
 """
 
 import re
@@ -10,9 +10,12 @@ import string
 
 REDACTED = "[REDACTED]"
 
-# Length limits (local part 64, labels 63) keep matching linear on long runs of letters
-# and bound how long a single match can get.
-EMAIL = r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,63}"
+# Local part: the RFC 5322 atom characters, starting with a letter or digit so leading Markdown
+# (`**`, a backtick, a quote) stays outside the match. Length limits (local part 64, labels 63)
+# keep matching linear on long runs and bound how long a single match can get.
+LOCAL_PART_SYMBOLS = ".!#$%&'*+/=?^_`{|}~-"
+LOCAL_PART = f"[A-Za-z0-9][A-Za-z0-9{re.escape(LOCAL_PART_SYMBOLS)}]{{0,63}}"
+EMAIL = LOCAL_PART + r"@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,63}"
 # [0-9] instead of \d so non-ASCII digits don't widen the match.
 SSN = r"(?<![0-9])[0-9]{3}-[0-9]{2}-[0-9]{4}(?![0-9])"
 # A whole run of 13-48 digits with optional single space/dash separators. Matching the
@@ -21,11 +24,14 @@ DIGIT_RUN = r"(?<![0-9])[0-9](?:[ -]?[0-9]){12,47}(?![0-9])"
 PII_PATTERN = re.compile(f"(?P<email>{EMAIL})|(?P<ssn>{SSN})|(?P<digits>{DIGIT_RUN})")
 SSN_PATTERN = re.compile(SSN)
 
-EMAIL_CHARS = frozenset(string.ascii_letters + string.digits + "._%+-@")
+EMAIL_CHARS = frozenset(string.ascii_letters + string.digits + LOCAL_PART_SYMBOLS + "@")
 NUMBER_CHARS = frozenset(string.digits + " -")
 
-# Longest valid email is 254 chars; a digit run match is at most 95.
-MAX_HOLDBACK = 256
+# Longest possible match: an email of 64 + 1 + 63 + 8 * 64 + 1 + 63 = 704 chars (a digit run is
+# at most 95). Holding back at least that much means text already sent can never turn out to be
+# the start of a match. Because a cut never splits a match, `pending` can reach
+# MAX_HOLDBACK + 703 = 1,407 chars after a feed, per choice.
+MAX_HOLDBACK = 704
 
 
 def luhn_valid(digits: str) -> bool:

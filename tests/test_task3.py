@@ -109,7 +109,7 @@ def test_adversarial_inputs_stream_the_same_as_whole_text():
     # Glued tokens with no separators, stray @ and -, PII next to digits, non-ASCII digits.
     tokens = ["a", "Z", "0", "7", "-", " ", ".", "@", "_", "+", "x@y.co", "123-45-6789", "4111 1111 1111 1111",
               "4111111111111111", "b@c.org", "\n", ",", "foo", "99", "4242-4242-4242-4242", "é", "١", "12/26",
-              "555 123 4567"]
+              "555 123 4567", "'", "!", "*", "`", "=", "o'c", "{x}", "~", "#"]
     failures = []
     for seed in range(2000):
         rng = random.Random(seed)
@@ -136,6 +136,50 @@ def test_long_inputs_stay_fast_and_bounded():
     for chunk in split_every("x@" + "ab." * 20_000, 5):
         redactor.feed(chunk)
         assert len(redactor.pending) <= 1_000
+
+
+EMAIL_LOCAL_PARTS = [
+    ("Mail o'connor@example.com now", "Mail [REDACTED] now"),
+    ("Mail a!b@example.com now", "Mail [REDACTED] now"),
+    ("Mail j.o'neil+promo@mail.example.co.uk.", "Mail [REDACTED]."),
+    ("Mail x#y$z%w&v*u/t=s?r^q_p`o{n|m}l~k-j@example.org", "Mail [REDACTED]"),
+    ("Bold **bob@example.com** and code `bob@example.com`", "Bold **[REDACTED]** and code `[REDACTED]`"),
+    ("Quoted 'bob@example.com' or (bob@example.com)", "Quoted '[REDACTED]' or ([REDACTED])"),
+    ("Not an email: it's me! @home, a@b, x@y.z", "Not an email: it's me! @home, a@b, x@y.z"),
+]
+
+
+@pytest.mark.parametrize("text, expected", EMAIL_LOCAL_PARTS)
+def test_whole_email_local_part_is_redacted(text, expected):
+    assert redact_text(text) == expected
+    for size in (1, 2, 5):
+        assert stream_through(text, split_every(text, size)) == expected
+
+
+def test_emails_longer_than_the_old_256_char_cap_are_not_released_early():
+    # Six 63-digit labels: a 400-char string the email pattern accepts once ".com" arrives.
+    email = "bob@" + ".".join(str(digit) * 63 for digit in range(1, 7)) + ".com"
+    text = f"mail {email} now"
+    assert redact_text(text) == "mail [REDACTED] now"
+    assert stream_through(text, split_every(text, 1)) == "mail [REDACTED] now"
+
+
+def test_pending_buffer_bound_matches_documented_limit():
+    # Longest email the pattern allows: 64 + 1 + 63 + 8 * 64 + 1 + 63 = 704 chars. The buffer may hold
+    # one held-back window plus one match crossing it: 704 + 703 = 1,407 chars after any feed.
+    longest = "a" * 64 + "@" + ".".join(["b" * 63] * 9) + "." + "c" * 63
+    assert len(longest) == 704 == MAX_HOLDBACK
+    assert redact_text(f"<{longest}>") == "<[REDACTED]>"
+    peak = 0
+    redactor = StreamRedactor()
+    emitted = []
+    for text in ["z" * 703 + longest, longest + "d" * 2000, ("x" * 63 + longest) * 3]:
+        for chunk in split_every(text, 1):
+            emitted.append(redactor.feed(chunk))
+            peak = max(peak, len(redactor.pending))
+    emitted.append(redactor.flush())
+    assert peak <= 1407
+    assert "b" * 63 not in "".join(emitted)
 
 
 @pytest.mark.parametrize(
@@ -328,3 +372,148 @@ async def test_invalid_requests_are_rejected():
         no_messages = await client.post("/v1/chat/completions", json={"model": "m"})
     assert bad_json.status_code == 400
     assert no_messages.status_code == 400
+
+
+def event_line(choice: dict, **fields) -> str:
+    return f"data: {json.dumps({'id': 'c1', 'model': 'm', **fields, 'choices': [choice]})}"
+
+
+def logprob_choice(token: str) -> dict:
+    alternative = {"token": token, "bytes": list(token.encode()), "logprob": -0.5}
+    return {
+        "index": 0,
+        "delta": {"content": token, "refusal": token, "tool_calls": [{"function": {"arguments": token}}]},
+        "logprobs": {"content": [{**alternative, "top_logprobs": [alternative]}], "refusal": None},
+        "finish_reason": None,
+    }
+
+
+async def test_only_redacted_content_leaves_the_stream():
+    # The email arrives split across tokens; logprobs, refusals and tool-call arguments repeat each token.
+    tokens = ["Mail ", "bob", "@", "example", ".com", " ok"]
+    lines = [event_line(logprob_choice(token), debug="bob@example.com") for token in tokens]
+    lines += [event_line({"index": 0, "delta": {}, "finish_reason": "stop"}, usage={"total_tokens": 9}), "data: [DONE]"]
+
+    raw = await collect(redact_sse_stream(as_async(lines)))
+    events, done = parse_sse(raw)
+
+    assert done
+    assert content_of(events) == "Mail [REDACTED] ok"
+    for secret in [b"bob", b"example", b"98, 111, 98", b"logprobs", b"refusal", b"tool_calls", b"debug"]:
+        assert secret not in raw
+    for event in events:
+        assert set(event) <= {"id", "model", "usage", "choices"}
+        for choice in event["choices"]:
+            assert set(choice) == {"index", "delta", "finish_reason"}
+            assert set(choice["delta"]) <= {"role", "content"}
+    assert events[-1]["usage"] == {"total_tokens": 9}
+
+
+def logprob_provider_transport(seen_requests: list):
+    async def body():
+        for token in ["Mail ", "bob", "@", "example", ".com"]:
+            yield (event_line(logprob_choice(token)) + "\n\n").encode()
+        yield b"data: [DONE]\n\n"
+
+    def handler(request):
+        seen_requests.append(json.loads(request.content))
+        if not seen_requests[-1].get("stream"):
+            message = {"role": "assistant", "content": "Mail bob@example.com", "refusal": "bob@example.com"}
+            logprobs = {"content": [{"token": "bob@example.com", "bytes": [98], "logprob": -1}]}
+            choice = {"index": 0, "message": message, "logprobs": logprobs, "finish_reason": "stop"}
+            return httpx.Response(200, json={"id": "c1", "choices": [choice], "usage": {"total_tokens": 5}})
+        return httpx.Response(200, content=body(), headers={"content-type": "text/event-stream"})
+
+    return httpx.MockTransport(handler)
+
+
+async def test_logprobs_requested_by_the_client_cannot_reveal_redacted_text():
+    seen = []
+    request = {**REQUEST, "logprobs": True, "top_logprobs": 2}
+    async with gateway_client(logprob_provider_transport(seen)) as client:
+        streamed = await client.post("/v1/chat/completions", json=request)
+        plain = await client.post("/v1/chat/completions", json={**request, "stream": False})
+
+    assert seen[0]["logprobs"] is True  # the option reached the provider, so it did send logprobs back
+    events, done = parse_sse(streamed.content)
+    assert done
+    assert content_of(events) == "Mail [REDACTED]"
+    assert "bob" not in streamed.text
+    assert plain.status_code == 200
+    assert plain.json() == {
+        "id": "c1",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "Mail [REDACTED]"}, "finish_reason": "stop"}],
+        "usage": {"total_tokens": 5},
+    }
+
+
+STREAM_ERROR = {"error": {"type": "upstream_error", "message": "LLM provider sent an invalid event"}}
+
+
+@pytest.mark.parametrize(
+    "bad_line",
+    [
+        "data: null",
+        "data: []",
+        "data: 42",
+        'data: {"choices": null}',
+        'data: {"id": "c1"}',
+        'data: {"error": {"message": "internal failure for bob@example.com"}}',
+        'data: {"choices": [null]}',
+        'data: {"choices": [{"index": [0], "delta": {"content": "x"}}]}',
+        'data: {"choices": [{"index": 0, "delta": "bob@example.com"}]}',
+        'data: {"choices": [{"index": 0, "delta": {"content": ["bob@example.com"]}}]}',
+        'data: {"choices": [{"index": 0, "delta": {}, "finish_reason": {"text": "bob@example.com"}}]}',
+        "data: not json bob@exam",
+    ],
+)
+async def test_malformed_provider_events_end_the_stream_safely(bad_line):
+    lines = [event_line({"index": 0, "delta": {"content": "Hi carol@exam"}}), bad_line, event_line({"index": 0, "delta": {"content": "x"}})]
+    raw = await collect(redact_sse_stream(as_async(lines)))
+    events, done = parse_sse(raw)
+
+    assert not done
+    # Held text is flushed (redacted on its own), then a sanitized error; nothing after the bad event.
+    assert content_of(events) == "Hi carol@exam"
+    assert events[-1] == STREAM_ERROR
+    assert b"bob" not in raw
+
+
+async def test_malformed_completion_is_a_gateway_error():
+    for body in [None, [], {"choices": "x"}, {"choices": [{"message": "bob@example.com"}]}]:
+        transport = httpx.MockTransport(lambda request, body=body: httpx.Response(200, json=body))
+        async with gateway_client(transport) as client:
+            response = await client.post("/v1/chat/completions", json={**REQUEST, "stream": False})
+        assert response.status_code == 502
+        assert response.json() == {"error": {"type": "upstream_error", "message": "LLM provider returned an invalid response"}}
+
+
+class TrackedStream(httpx.AsyncByteStream):
+    def __init__(self, lines: list[str], error: Exception | None = None):
+        self.lines, self.error, self.closed = lines, error, False
+
+    async def __aiter__(self):
+        for line in self.lines:
+            yield (line + "\n").encode()
+        if self.error:
+            raise self.error
+
+    async def aclose(self):
+        self.closed = True
+
+
+@pytest.mark.parametrize(
+    "lines, error",
+    [
+        (sse_lines(["fine"]), None),
+        (["data: null"], None),
+        (sse_lines(["half"])[:2], httpx.ReadError("reset")),
+    ],
+)
+async def test_provider_response_is_closed_however_the_stream_ends(lines, error):
+    stream = TrackedStream(lines, error)
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, stream=stream))
+    async with gateway_client(transport) as client:
+        response = await client.post("/v1/chat/completions", json=REQUEST)
+    assert response.status_code == 200
+    assert stream.closed

@@ -155,7 +155,9 @@ What they cover, briefly:
 - **Task 3**: detection against hand-written expected outputs (including cards and SSNs next to other digits),
   streaming output equal to whole-text redaction for many chunk sizes, 200 random chunkings and 2,000 seeded
   adversarial inputs, PII split at every kind of boundary, long-input speed and bounded buffer, first output
-  emitted before the provider finishes, SSE format preserved, multiple choices, provider errors.
+  emitted before the provider finishes, SSE format preserved, multiple choices, provider errors, RFC 5322 email
+  local parts, the documented buffer bound, `logprobs`/refusal/tool-call fields never reaching the client,
+  malformed provider events, and the provider response being closed on every exit path.
 - **Task 4**: window boundaries with a fake clock, eviction from disk, persistence across instances, 40 threads and
   30 concurrent HTTP requests against one budget, fallback on 429/timeout/5xx/network/bad JSON, no fallback on 400,
   both providers failing, and error payloads that never contain upstream details.
@@ -193,12 +195,21 @@ algorithm list is pinned, so the role can't be self-asserted. Other points:
 **Task 3.** `StreamRedactor` keeps a small pending buffer. After each chunk it holds back only the trailing run
 of characters that could still become part of a match: email characters, or digits/spaces/dashes for SSNs and
 cards. Everything before that is redacted and sent immediately, so the extra latency is roughly one word. The
-buffer is capped at 256 characters and the cut never goes through a match; every pattern has a maximum length,
-so the buffer stays bounded. Tests check that streaming output is identical to redacting the full text at once,
-including 2,000 seeded adversarial inputs. Digits are matched as whole runs (up to 48 digits) and then checked
-inside, so a card or SSN next to unrelated digits (`4111 1111 1111 1111 12/26`) is still found. The SSE layer rewrites
-only `choices[].delta.content` and keeps the rest of each event as-is; held text is flushed on `finish_reason`,
-`[DONE]`, or end of stream.
+hold-back is capped at 704 characters, the longest string any pattern can match, so text that has been sent can
+never turn out to be the start of a match. The cut never goes through a match, so the buffer holds at most
+704 + 703 = 1,407 characters per choice after each chunk. Tests check that streaming output is identical to
+redacting the full text at once, including 2,000 seeded adversarial inputs. Digits are matched as whole runs (up to
+48 digits) and then checked inside, so a card or SSN next to unrelated digits (`4111 1111 1111 1111 12/26`) is still
+found. Email local parts accept the RFC 5322 characters (`o'connor`, `a!b`) but must start with a letter or digit, so
+Markdown around an address (`**bob@x.com**`) is kept.
+
+The SSE layer forwards an allowlist: per choice only `index`, `finish_reason` and a `delta` with `role` and the
+redacted `content`, plus top-level `id`/`object`/`created`/`model`/`system_fingerprint`/`usage`. Everything else
+(`logprobs`, tool calls, refusals, audio, unknown fields) is dropped, because it can repeat the generated text in
+a form that isn't redacted; `logprobs` tokens and byte arrays would otherwise spell out a redacted email. The
+non-streaming path applies the same allowlist to `message`. An event that isn't JSON or doesn't have that shape
+ends the stream with a sanitized error event after flushing held text. Held text is flushed on `finish_reason`,
+`[DONE]`, or end of stream, and the provider response is closed in a `finally` however the stream ends.
 
 **Task 4.**
 - Rate limiter is a sliding log: one SQLite row per request (`tenant`, `tokens`, `created_at`). The
@@ -234,10 +245,13 @@ only `choices[].delta.content` and keeps the rest of each event as-is; held text
 - **Task 3**: regex detection is pattern matching, not real PII detection. It covers emails, dashed US SSNs
   (`123-45-6789`) and 13-19 digit card numbers (optional single space/dash separators, Luhn-checked). It misses
   SSNs without dashes, obfuscated values (`john at example dot com`), numbers spelled out, PII in other languages
-  or scripts, cards straddling the boundary of a digit run longer than 48 digits, and values inside email-character
-  runs longer than 256 characters. It can over-redact digits next to a card, or numbers that happen to look like
-  a dashed SSN or pass Luhn. Only response content is redacted, not the
-  prompt. Assumes OpenAI-style single-line `data:` events.
+  or scripts, quoted or non-ASCII email local parts, cards glued to other digits with no separator
+  (`41111111111111115500000000000004`), and cards straddling the boundary of a digit run longer than 48 digits.
+  It can over-redact digits next to a card, numbers that happen to look like a dashed SSN or pass Luhn, and
+  characters glued to the front of an email (`x=bob@x.com` loses `x=`). Only response text is passed through:
+  clients asking for `logprobs` or tools get none back. The prompt isn't redacted. Assumes OpenAI-style
+  single-line `data:` events; the 1,407-char bound is per choice, and the size of a single provider event line
+  and the number of choices aren't capped.
 - **Task 4**: the byte estimate is deliberately pessimistic, not a real tokenizer. English prompts reserve about
   4x their real token count (CJK about 2-3x) until the request settles, so a tenant can get 429s while actual usage
   is below the limit, and a request whose byte estimate exceeds the whole budget is rejected with 400 even if its

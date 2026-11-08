@@ -112,7 +112,7 @@ async def test_trigger_refund_accepts_integer_amount():
 
 @pytest.mark.parametrize(
     "amount, balance_after",
-    [(0.001, 499.999), (10.005, 489.995), (0.1, 499.9), (1e-9, 499.999999999), (500, 0.0)],
+    [(0.001, 499.999), (10.005, 489.995), (0.1, 499.9), (1e-9, 499.999999999), (1e-13, 499.9999999999999), (500, 0.0)],
 )
 async def test_any_positive_float_up_to_the_balance_is_refunded_exactly(amount, balance_after):
     # The assessment only asks for a positive float; no hidden 2-decimal rule, no silent rounding.
@@ -123,10 +123,30 @@ async def test_any_positive_float_up_to_the_balance_is_refunded_exactly(amount, 
     assert server.CUSTOMERS["CUST-00001"]["refundable_balance"] == balance_after
 
 
-async def test_reason_has_a_minimum_length_but_no_maximum():
-    result = await call("trigger_refund", {**VALID_REFUND, "reason": "x" * 5000})
+async def test_successive_refunds_each_reduce_the_balance():
+    for balance_after in [75.4, 75.3, 75.2]:
+        result = await call("trigger_refund", {**VALID_REFUND, "customer_id": "CUST-00002", "amount": 0.1})
+        assert result.is_error is False
+        assert server.CUSTOMERS["CUST-00002"]["refundable_balance"] == balance_after
+
+
+@pytest.mark.parametrize("customer_id, amount", [("CUST-00002", 1e-15), ("CUST-00001", 1e-14), ("CUST-00001", 5e-324)])
+async def test_refund_too_small_to_change_the_balance_is_a_business_error(customer_id, amount):
+    # 75.5 - 1e-15 rounds back to 75.5 as a float; accepting it would report a refund that changed nothing.
+    balance = server.CUSTOMERS[customer_id]["refundable_balance"]
+    result = await call("trigger_refund", {**VALID_REFUND, "customer_id": customer_id, "amount": amount})
+
+    assert result.is_error is True
+    assert result.content[0].text == f"Refund of {amount} is too small to apply to a balance of {balance}"
+    assert server.CUSTOMERS[customer_id]["refundable_balance"] == balance
+
+
+@pytest.mark.parametrize("reason", ["0123456789", "123456789 ", " 12345678 ", " " * 10, "x" * 5000])
+async def test_reason_needs_ten_characters_as_written_and_has_no_maximum(reason):
+    # The task says "minimum length 10"; whitespace counts like any other character.
+    result = await call("trigger_refund", {**VALID_REFUND, "reason": reason})
     assert result.is_error is False
-    assert result.structured_content["reason"] == "x" * 5000
+    assert result.structured_content["reason"] == reason
 
 
 @pytest.mark.parametrize("amount", [0, -1, -0.01, -1e-9, "10.00", True, None, math.inf, math.nan, [10]])
@@ -135,7 +155,7 @@ async def test_trigger_refund_rejects_invalid_amount(amount):
     assert error.data[0]["field"] == "amount"
 
 
-@pytest.mark.parametrize("reason", ["too short", "", "   short   ", " " * 20, 1234567890, None])
+@pytest.mark.parametrize("reason", ["too short", "", "123456789", " " * 9, " short  ", 1234567890, None, ["0123456789"]])
 async def test_trigger_refund_rejects_invalid_reason(reason):
     error = await call_expecting_protocol_error("trigger_refund", {**VALID_REFUND, "reason": reason})
     assert error.data[0]["field"] == "reason"

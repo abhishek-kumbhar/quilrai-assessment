@@ -20,7 +20,7 @@ from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 from mcp.shared.exceptions import MCPError
 from mcp.shared.message import SessionMessage
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 logger = logging.getLogger("task1_mcp_server")
 
@@ -39,8 +39,7 @@ class TriggerRefundInput(BaseModel):
 
     customer_id: CustomerId
     amount: float = Field(gt=0, allow_inf_nan=False, description="Refund amount, must be positive")
-    # Surrounding whitespace doesn't count towards the 10 characters.
-    reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=10)]
+    reason: str = Field(min_length=10, description="Reason for the refund, at least 10 characters")
 
 
 CUSTOMERS: dict[str, dict[str, Any]] = {
@@ -66,7 +65,11 @@ def trigger_refund(args: TriggerRefundInput) -> types.CallToolResult:
         return tool_error(f"Refund of {args.amount} exceeds refundable balance of {balance}")
 
     # Subtract the decimal values as written, so 75.5 - 0.1 leaves 75.4 rather than 75.39999999999999.
-    record["refundable_balance"] = float(Decimal(str(balance)) - Decimal(str(args.amount)))
+    new_balance = float(Decimal(str(balance)) - Decimal(str(args.amount)))
+    if new_balance == balance:
+        # e.g. 1e-15 off 75.5: below the stored balance's precision, so it can't be recorded.
+        return tool_error(f"Refund of {args.amount} is too small to apply to a balance of {balance}")
+    record["refundable_balance"] = new_balance
     refund = {
         "refund_id": f"RF-{uuid.uuid4().hex[:10]}",
         "customer_id": args.customer_id,

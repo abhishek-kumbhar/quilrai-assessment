@@ -35,10 +35,12 @@ class CompletionRequest(BaseModel):
 
 
 def estimate_tokens(request: CompletionRequest) -> int:
-    # Rough upper-bound reservation: ~4 chars per token plus per-message overhead, plus the
-    # full completion budget. Corrected with the provider's reported usage afterwards.
-    prompt_chars = sum(len(message.content) for message in request.messages)
-    return math.ceil(prompt_chars / 4) + 4 * len(request.messages) + request.max_tokens
+    # Conservative reservation. Byte-level BPE tokenizers emit at most one token per UTF-8 byte,
+    # so the byte count bounds prompt tokens even for CJK text or emoji, where chars/4 can be
+    # several times too low. Plus per-message overhead and the full completion budget.
+    # Replaced by the provider's reported usage afterwards.
+    prompt_bytes = sum(len(message.content.encode("utf-8")) for message in request.messages)
+    return prompt_bytes + 4 * len(request.messages) + request.max_tokens
 
 
 def tenant_id(api_key: str) -> str:

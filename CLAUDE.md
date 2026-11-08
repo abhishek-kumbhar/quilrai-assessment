@@ -23,7 +23,7 @@
   streaming output == `redact_text(full_text)` for any chunking. Digits are matched as whole runs (13-48 digits);
   `redact_digit_run` redacts SSNs and Luhn-valid 13-19 digit group sequences inside them. Every pattern has a max length.
 - Task 4 limiter is a sliding log in SQLite (`token_usage` rows), check+insert inside `BEGIN IMMEDIATE`,
-  connection per operation (run via `asyncio.to_thread`). Reserve estimate (chars/4 + 4/message + max_tokens),
+  connection per operation (run via `asyncio.to_thread`). Reserve estimate (prompt UTF-8 bytes + 4/message + max_tokens),
   settle to provider `usage.total_tokens`, release if every provider fails. Tenant stored as sha256 prefix of key.
   Router wraps the whole primary call in `asyncio.timeout(3.0)`; falls back on 429/timeout/5xx/network/bad JSON,
   not on other 4xx. Clients only ever see `{"error": {type, message, request_id}}`.

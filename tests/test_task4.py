@@ -136,9 +136,26 @@ def test_concurrent_threads_cannot_exceed_budget(db_path):
     assert limiter.tokens_used("t1") == 50_000
 
 
-def test_token_estimate_covers_prompt_and_completion_budget():
-    request = CompletionRequest.model_validate({"messages": [{"role": "user", "content": "x" * 400}], "max_tokens": 50})
-    assert estimate_tokens(request) == 100 + 4 + 50
+@pytest.mark.parametrize(
+    "messages, prompt_bytes",
+    [
+        ([{"role": "user", "content": "Hello, world!"}], 13),  # English: 1 byte per char
+        ([{"role": "user", "content": "你好，世界"}], 15),  # Chinese: 3 bytes per char
+        ([{"role": "user", "content": "こんにちは"}], 15),  # Japanese: 3 bytes per char
+        ([{"role": "user", "content": "👍🏽"}], 8),  # emoji + skin tone modifier: 4 bytes each
+        ([{"role": "user", "content": "café e\u0301"}], 9),  # precomposed é (2) and e + combining accent (1 + 2)
+        ([{"role": "system", "content": "Be brief."}, {"role": "user", "content": "日本"}], 9 + 6),
+    ],
+)
+def test_token_estimate_reserves_utf8_bytes_plus_overhead_and_completion(messages, prompt_bytes):
+    request = CompletionRequest.model_validate({"messages": messages, "max_tokens": 50})
+    assert estimate_tokens(request) == prompt_bytes + 4 * len(messages) + 50
+
+
+def test_token_estimate_is_at_least_one_token_per_character_for_cjk():
+    # chars/4 would reserve 25 tokens here; real tokenizers use roughly 100 or more.
+    request = CompletionRequest.model_validate({"messages": [{"role": "user", "content": "漢" * 100}], "max_tokens": 1})
+    assert estimate_tokens(request) >= 100
 
 
 # ---------- router ----------
@@ -346,11 +363,11 @@ async def test_rate_limited_tenant_gets_429_with_retry_after(db_path):
 
 
 async def test_concurrent_requests_cannot_bypass_budget(db_path):
-    # Each request reserves ceil(2/4) + 4 + 995 = 1000 tokens against a 10k budget. The provider
+    # Each request reserves 2 bytes + 4 + 994 = 1000 tokens against a 10k budget. The provider
     # reports the same total, so the result doesn't depend on when reservations get settled.
     mock = ProviderMock(primary="slow", slow_seconds=0.05, total_tokens=1000)
     client, limiter = gateway(db_path, mock, limit_tokens=10_000)
-    payload = {"messages": [{"role": "user", "content": "Hi"}], "max_tokens": 995}
+    payload = {"messages": [{"role": "user", "content": "Hi"}], "max_tokens": 994}
     async with client:
         responses = await asyncio.gather(
             *[client.post("/v1/chat/completions", json=payload, headers=AUTH) for _ in range(30)]
@@ -360,6 +377,62 @@ async def test_concurrent_requests_cannot_bypass_budget(db_path):
     assert statuses.count(200) == 10
     assert statuses.count(429) == 20
     assert limiter.tokens_used(tenant_id(TENANT_KEY)) == 10_000
+
+
+async def test_concurrent_multibyte_requests_near_budget(db_path):
+    # "日本語" is 9 bytes, so each request reserves 9 + 4 + 87 = 100 tokens of a 1,000 budget.
+    mock = ProviderMock(primary="slow", slow_seconds=0.05, total_tokens=100)
+    client, limiter = gateway(db_path, mock, limit_tokens=1_000)
+    payload = {"messages": [{"role": "user", "content": "日本語"}], "max_tokens": 87}
+    async with client:
+        responses = await asyncio.gather(
+            *[client.post("/v1/chat/completions", json=payload, headers=AUTH) for _ in range(12)]
+        )
+
+    statuses = [r.status_code for r in responses]
+    assert statuses.count(200) == 10
+    assert statuses.count(429) == 2
+    assert limiter.tokens_used(tenant_id(TENANT_KEY)) == 1_000
+
+
+async def send_sequentially(client, count):
+    statuses = []
+    for _ in range(count):
+        response = await client.post("/v1/chat/completions", json={**PAYLOAD, "max_tokens": 400}, headers=AUTH)
+        statuses.append(response.status_code)
+    return statuses
+
+
+async def test_lower_reported_usage_frees_budget(db_path):
+    # Each request reserves 5 + 4 + 400 = 409. Without reconciliation the third wouldn't fit in 1,000.
+    client, limiter = gateway(db_path, ProviderMock(total_tokens=50), limit_tokens=1_000)
+    async with client:
+        assert await send_sequentially(client, 3) == [200, 200, 200]
+    assert limiter.tokens_used(tenant_id(TENANT_KEY)) == 150
+
+
+async def test_higher_reported_usage_is_charged_and_blocks_next_request(db_path):
+    client, limiter = gateway(db_path, ProviderMock(total_tokens=900), limit_tokens=1_000)
+    async with client:
+        assert await send_sequentially(client, 2) == [200, 429]
+    assert limiter.tokens_used(tenant_id(TENANT_KEY)) == 900
+
+
+async def test_missing_reported_usage_keeps_the_estimate(db_path):
+    client, limiter = gateway(db_path, ProviderMock(total_tokens=None), limit_tokens=1_000)
+    async with client:
+        assert await send_sequentially(client, 1) == [200]
+    assert limiter.tokens_used(tenant_id(TENANT_KEY)) == 409
+
+
+async def test_multibyte_prompt_can_be_rejected_even_if_real_tokens_would_fit(db_path):
+    # 300 CJK chars = 900 bytes; with max_tokens 100 that reserves 1,004 > 1,000, although a real
+    # tokenizer would likely count ~300-450 prompt tokens. Documented tradeoff of the byte estimate.
+    client, _ = gateway(db_path, ProviderMock(), limit_tokens=1_000)
+    payload = {"messages": [{"role": "user", "content": "你" * 300}], "max_tokens": 100}
+    async with client:
+        response = await client.post("/v1/chat/completions", json=payload, headers=AUTH)
+    assert_gateway_error(response, 400, "invalid_request")
 
 
 async def test_upstream_failures_are_sanitized_and_not_charged(db_path):

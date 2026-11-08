@@ -121,7 +121,7 @@ curl -si localhost:8004/v1/chat/completions -H 'Authorization: Bearer tenant-a-k
 ```
 
 To see the limiter, restart the gateway with `TOKENS_PER_MINUTE=1000` and send three requests at once. Each reserves
-406 tokens (2 prompt + 4 overhead + 400 `max_tokens`) while the slow primary is timing out, so the third doesn't fit:
+409 tokens (5 prompt bytes + 4 overhead + 400 `max_tokens`) while the slow primary is timing out, so the third doesn't fit:
 
 ```bash
 for i in 1 2 3; do curl -s -o /dev/null -w '%{http_code}\n' localhost:8004/v1/chat/completions \
@@ -198,10 +198,14 @@ only `choices[].delta.content` and keeps the rest of each event as-is; held text
   (threads or separate processes on the same file) can't both see the same total and both pass. Rows older than
   the window are deleted on every reservation. Tenant keys are stored as SHA-256 prefixes.
 - OpenAI-style requests may include `model`; it is accepted but ignored, since the router picks the provider model.
-- Token accounting: before the call the gateway reserves an estimate, `ceil(prompt_chars / 4) + 4 per message +
-  max_tokens` (default `max_tokens` 512). After a successful call the reservation is replaced with the provider's
-  `usage.total_tokens`. If every provider fails the reservation is released, so tenants aren't charged for
-  gateway-side failures.
+- Token accounting: before the call the gateway reserves `UTF-8 bytes of the prompt + 4 per message + max_tokens`
+  (default `max_tokens` 512). After a successful call the reservation is replaced with the provider's
+  `usage.total_tokens` (replaced, not added to, so completion tokens are never counted twice). If every provider
+  fails the reservation is released, so tenants aren't charged for gateway-side failures.
+- Why bytes: the byte-level BPE tokenizers most providers use emit at most one token per UTF-8 byte, so the byte
+  count is an upper bound on prompt tokens. A `chars / 4` heuristic is close for English but several times too low
+  for Chinese/Japanese text or emoji, and the tenant controls the prompt, so admission could be gamed. With the
+  byte bound, admission never lets a request in on an underestimate of its prompt.
 - Fallback: the primary call runs inside `asyncio.timeout(3.0)`, which covers connect, headers and body. httpx's
   own timeouts are per phase, so a slowly trickling response could otherwise run past 3s. When it fires, the
   primary request is cancelled before the secondary is called, so there is no race between a late primary
@@ -226,11 +230,12 @@ only `choices[].delta.content` and keeps the rest of each event as-is; held text
   runs longer than 256 characters. It can over-redact digits next to a card, or numbers that happen to look like
   a dashed SSN or pass Luhn. Only response content is redacted, not the
   prompt. Assumes OpenAI-style single-line `data:` events.
-- **Task 4**: the token estimate is a heuristic (~4 chars/token), not a real tokenizer. Because the reservation
-  includes `max_tokens`, a tenant can get 429s while actual usage is below the limit, until in-flight requests
-  settle. The estimate is not an upper bound: prompts that tokenize densely (CJK text, emoji, unusual symbols)
-  can use several times more tokens than `chars / 4`, and the tenant controls that. After settlement the window
-  then holds more than the limit; later requests are blocked until it drains, but within that window the limit is
-  exceeded. If a request is cancelled mid-flight its reservation stays at
-  the estimate. One SQLite write lock serializes all reservations: fine for a single gateway node, not for a
+- **Task 4**: the byte estimate is deliberately pessimistic, not a real tokenizer. English prompts reserve about
+  4x their real token count (CJK about 2-3x) until the request settles, so a tenant can get 429s while actual usage
+  is below the limit, and a request whose byte estimate exceeds the whole budget is rejected with 400 even if its
+  real token count would fit (e.g. a 50 KB English prompt against a 50k tokens/min limit). The bound assumes a
+  byte-level tokenizer and only allows 4 tokens per message for chat formatting; tokens a provider adds itself
+  (hidden system prompts, tool definitions) aren't covered, so reported usage can still exceed the reservation,
+  in which case the window briefly holds more than the limit and later requests are blocked until it drains.
+  If a request is cancelled mid-flight its reservation stays at the estimate. One SQLite write lock serializes all reservations: fine for a single gateway node, not for a
   horizontally scaled fleet (use Redis or similar there). Only non-streaming completions are routed.

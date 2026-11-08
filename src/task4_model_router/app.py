@@ -44,15 +44,18 @@ def estimate_tokens(request: CompletionRequest) -> int:
     return prompt_bytes + 4 * len(request.messages) + request.max_tokens
 
 
-def reported_tokens(completion: dict, limit_tokens: int) -> int | None:
+# Far above any real completion, and low enough that summing a window of rows can't overflow
+# SQLite's 64-bit integers. Independent of the tenant budget, so raising the budget keeps real usage.
+MAX_REPORTED_TOKENS = 10**12
+
+
+def reported_tokens(completion: dict) -> int | None:
     """The provider's usage.total_tokens if it is usable, else None (the estimate is kept)."""
     usage = completion.get("usage")
     total = usage.get("total_tokens") if isinstance(usage, dict) else None
     if type(total) is not int or total < 0:  # `type(...) is int` rejects bool
         return None
-    # Any count >= the limit blocks the tenant until this row expires, so capping it changes no
-    # admission decision and keeps the stored value well inside SQLite's integer range.
-    return min(total, limit_tokens)
+    return min(total, MAX_REPORTED_TOKENS)
 
 
 def tenant_id(api_key: str) -> str:
@@ -75,9 +78,11 @@ def create_app(limiter: TokenRateLimiter, router: ModelRouter, tenant_api_keys: 
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        yield
-        # The app owns the router's HTTP client from here on, as in the other gateways.
-        await router.client.aclose()
+        try:
+            yield
+        finally:
+            # The router (and its HTTP client) is handed to the app, which closes it on shutdown.
+            await router.client.aclose()
 
     app = FastAPI(title="LLM Gateway model router", lifespan=lifespan)
 
@@ -114,7 +119,7 @@ def create_app(limiter: TokenRateLimiter, router: ModelRouter, tenant_api_keys: 
                 return gateway_error(503, "upstream_unavailable", "All model providers are currently unavailable", request_id)
             return gateway_error(502, "upstream_error", "Model provider rejected the request", request_id)
 
-        actual = reported_tokens(completion, limiter.limit_tokens)
+        actual = reported_tokens(completion)
         if actual is not None:
             await asyncio.to_thread(limiter.settle, reservation, actual)
 

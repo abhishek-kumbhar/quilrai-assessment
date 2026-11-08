@@ -8,7 +8,7 @@ from contextlib import closing
 import httpx
 import pytest
 
-from task4_model_router.app import CompletionRequest, create_app, estimate_tokens, tenant_id
+from task4_model_router.app import MAX_REPORTED_TOKENS, CompletionRequest, create_app, estimate_tokens, reported_tokens, tenant_id
 from task4_model_router.mock_providers import create_provider_app
 from task4_model_router.rate_limiter import RateLimitExceeded, TokenRateLimiter
 from task4_model_router.router import ModelRouter, Provider, UpstreamError
@@ -475,8 +475,8 @@ def provider_reporting(usage):
         ("12", 409),
         (None, 409),
         ("absent", 409),
-        ({"total_tokens": 2**70}, 1_000),  # capped at the limit: same blocking effect, fits in SQLite
-        ({"total_tokens": 5_000}, 1_000),
+        ({"total_tokens": 2**70}, 10**12),  # capped so it fits in (and sums within) SQLite's 64-bit integers
+        ({"total_tokens": 5_000}, 5_000),  # above the budget, stored as reported
         ({"total_tokens": 0}, 0),
         ({"total_tokens": 12}, 12),
     ],
@@ -493,7 +493,39 @@ async def test_reported_usage_is_only_trusted_when_it_is_a_sane_integer(db_path,
 
     assert response.status_code == 200
     assert response.json()["choices"][0]["message"]["content"] == "hi"
-    assert follow_up.status_code == (429 if charged == 1_000 else 200)
+    assert follow_up.status_code == (429 if charged > 990 else 200)
+
+
+async def test_usage_above_the_budget_still_counts_after_the_budget_is_raised(db_path):
+    clock = FakeClock()
+    router = ModelRouter(PRIMARY, SECONDARY, httpx.AsyncClient(transport=httpx.MockTransport(provider_reporting({"total_tokens": 150}))))
+    app = create_app(TokenRateLimiter(db_path, limit_tokens=100, clock=clock), router, {TENANT_KEY})
+    async with router.client, httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gw") as client:
+        first = await client.post("/v1/chat/completions", json={**PAYLOAD, "max_tokens": 10}, headers=AUTH)
+    assert first.status_code == 200
+
+    # Restart with a higher budget a second later; the 150 tokens used are still in the window.
+    clock.now += 1
+    raised = TokenRateLimiter(db_path, limit_tokens=200, clock=clock)
+    assert raised.tokens_used(tenant_id(TENANT_KEY)) == 150
+    with pytest.raises(RateLimitExceeded):
+        raised.reserve(tenant_id(TENANT_KEY), 75)
+    raised.reserve(tenant_id(TENANT_KEY), 50)
+    assert raised.tokens_used(tenant_id(TENANT_KEY)) == 200
+
+
+@pytest.mark.parametrize("total", [2**31, 2**63 - 1, 2**63, 2**70, 10**400], ids=["2^31", "2^63-1", "2^63", "2^70", "10^400"])
+def test_huge_reported_usage_is_stored_without_overflowing_sqlite(db_path, total):
+    assert reported_tokens({"usage": {"total_tokens": total}}) == min(total, MAX_REPORTED_TOKENS)
+    limiter = TokenRateLimiter(db_path, limit_tokens=50_000)
+    # Several in-flight requests settling huge counts must still sum within 64-bit integers.
+    reservations = [limiter.reserve("t1", 100) for _ in range(5)]
+    for reservation in reservations:
+        limiter.settle(reservation, reported_tokens({"usage": {"total_tokens": total}}))
+
+    assert limiter.tokens_used("t1") == 5 * min(total, 10**12)
+    with pytest.raises(RateLimitExceeded):
+        limiter.reserve("t1", 1)
 
 
 async def test_router_client_is_closed_when_the_app_shuts_down(db_path):
@@ -501,6 +533,15 @@ async def test_router_client_is_closed_when_the_app_shuts_down(db_path):
     app = create_app(TokenRateLimiter(db_path), router, {TENANT_KEY})
     async with app.router.lifespan_context(app):
         assert not router.client.is_closed
+    assert router.client.is_closed
+
+
+async def test_router_client_is_closed_when_the_lifespan_exits_with_an_error(db_path):
+    router = make_router(ProviderMock())
+    app = create_app(TokenRateLimiter(db_path), router, {TENANT_KEY})
+    with pytest.raises(RuntimeError):
+        async with app.router.lifespan_context(app):
+            raise RuntimeError("startup failed")
     assert router.client.is_closed
 
 

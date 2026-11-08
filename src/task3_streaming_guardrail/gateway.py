@@ -1,7 +1,7 @@
 """LLM gateway endpoint that streams provider output back with PII redacted.
 
 Expects OpenAI-style chat completion streaming: one `data: {json}` line per event and a
-final `data: [DONE]`. Only the redacted text of each choice and a few typed metadata fields
+final `data: [DONE]`. Only the redacted text of each choice and a few string metadata fields
 are forwarded.
 """
 
@@ -16,7 +16,7 @@ import anyio
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from starlette.background import BackgroundTask
+from starlette.types import Receive, Scope, Send
 
 from task3_streaming_guardrail.redactor import StreamRedactor, redact_text
 
@@ -29,8 +29,10 @@ def gateway_error(status_code: int, error_type: str, message: str) -> JSONRespon
 
 # Only what is rebuilt below reaches the client. Other provider fields (logprobs, tool calls,
 # refusals, audio, debug data) can carry generated text that isn't redacted, so they are dropped.
+# So are numeric fields (`usage`, `created`): a number can't be redacted like text, and a card
+# number or SSN written as an integer would otherwise pass straight through.
 METADATA_STRINGS = ("id", "object", "model", "system_fingerprint")
-USAGE_COUNTS = ("prompt_tokens", "completion_tokens", "total_tokens")
+MAX_CHOICES = 128  # OpenAI's limit on `n`; also keeps `index` too small to carry a number like that
 FINISH_REASONS = ("stop", "length", "content_filter", "tool_calls", "function_call")
 CLOSE_TIMEOUT_SECONDS = 5
 
@@ -61,7 +63,8 @@ def checked_choices(body: Any, part: str) -> list[dict]:
     if not isinstance(choices, list):
         raise MalformedResponse("missing choices")
     for choice in choices:
-        if not isinstance(choice, dict) or not is_count(choice.get("index", 0)):
+        index = choice.get("index", 0) if isinstance(choice, dict) else None
+        if not is_count(index) or index >= MAX_CHOICES:
             raise MalformedResponse("bad choice")
         holder = choice.get(part)
         content = holder.get("content") if isinstance(holder, dict) else None
@@ -81,22 +84,33 @@ def safe_choice(choice: dict, part: str, content: str | None) -> dict:
 
 
 def safe_fields(body: dict) -> dict:
-    """Top-level metadata, keeping only known fields that have the expected type."""
-    # Free-form strings are redacted too: a provider could echo generated text into any of them.
-    safe: dict[str, Any] = {key: redact_text(body[key]) for key in METADATA_STRINGS if isinstance(body.get(key), str)}
-    if is_count(body.get("created")):
-        safe["created"] = body["created"]
-    usage = body.get("usage")
-    if isinstance(usage, dict):
-        safe["usage"] = {key: usage[key] for key in USAGE_COUNTS if is_count(usage.get(key))}
-    return safe
+    """Top-level string metadata, redacted: a provider could echo generated text into any of it."""
+    return {key: redact_text(body[key]) for key in METADATA_STRINGS if isinstance(body.get(key), str)}
 
 
 async def close_upstream(upstream: httpx.Response) -> None:
-    # Shielded: a client disconnect cancels the streaming task, and an unshielded close would be
+    # Shielded: a client disconnect arrives as cancellation, and an unshielded close would be
     # cancelled at its first await. Bounded so a stuck close can't hang the task.
     with anyio.move_on_after(CLOSE_TIMEOUT_SECONDS, shield=True):
         await upstream.aclose()
+
+
+class UpstreamStreamingResponse(StreamingResponse):
+    """Streams to the client and closes the provider response however sending ends.
+
+    Closing here rather than in the body generator also covers a client lost before the body
+    starts (while headers are sent) and a send that raises (ASGI 2.4 `BrokenPipeError`).
+    """
+
+    def __init__(self, upstream: httpx.Response, content: AsyncIterator[bytes], **kwargs: Any) -> None:
+        super().__init__(content, **kwargs)
+        self.upstream = upstream
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await close_upstream(self.upstream)
 
 
 async def redact_sse_stream(lines: AsyncIterator[str]) -> AsyncIterator[bytes]:
@@ -138,8 +152,7 @@ async def redact_sse_stream(lines: AsyncIterator[str]) -> AsyncIterator[bytes]:
                 yield stream_error("LLM provider sent an invalid event")
                 return
 
-            metadata = safe_fields(chunk)
-            template = {key: value for key, value in metadata.items() if key != "usage"}
+            template = safe_fields(chunk)
             safe_choices = []
             for choice in choices:
                 index = choice.get("index", 0)
@@ -151,7 +164,7 @@ async def redact_sse_stream(lines: AsyncIterator[str]) -> AsyncIterator[bytes]:
                     finished.add(index)
                 content = safe_text if "content" in delta or safe_text else None
                 safe_choices.append(safe_choice(choice, "delta", content))
-            yield sse_event({**metadata, "choices": safe_choices})
+            yield sse_event({**template, "choices": safe_choices})
     except httpx.HTTPError as exc:
         logger.error("provider stream failed: %r", exc)
         # As above: the held tail of an interrupted answer is dropped, not flushed.
@@ -217,26 +230,11 @@ def create_app(provider_url: str, http_client: httpx.AsyncClient | None = None) 
                 safe_choices.append(safe_choice(choice, "message", None if content is None else redact_text(content)))
             return JSONResponse({**safe_fields(completion), "choices": safe_choices})
 
-        async def redacted_events() -> AsyncIterator[bytes]:
-            # Close the provider response however the stream ends (done, error or client disconnect).
-            try:
-                async for event in redact_sse_stream(upstream.aiter_lines()):
-                    yield event
-            finally:
-                await close_upstream(upstream)
-
-        events = redacted_events()
-
-        async def close_events() -> None:
-            # A disconnect can stop the response while `events` is paused at a yield, where its
-            # `finally` wouldn't run until garbage collection; closing it here runs it right away.
-            await events.aclose()
-
-        return StreamingResponse(
-            events,
+        return UpstreamStreamingResponse(
+            upstream,
+            redact_sse_stream(upstream.aiter_lines()),
             media_type="text/event-stream",
             headers={"cache-control": "no-cache", "x-accel-buffering": "no"},
-            background=BackgroundTask(close_events),
         )
 
     return app

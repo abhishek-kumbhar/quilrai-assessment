@@ -5,6 +5,7 @@ import time
 
 import httpx
 import pytest
+from starlette.requests import ClientDisconnect
 
 from task3_streaming_guardrail import gateway, mock_provider
 from task3_streaming_guardrail.gateway import create_app, redact_sse_stream
@@ -413,11 +414,11 @@ async def test_only_redacted_content_leaves_the_stream():
     for secret in [b"bob", b"example", b"98, 111, 98", b"logprobs", b"refusal", b"tool_calls", b"debug"]:
         assert secret not in raw
     for event in events:
-        assert set(event) <= {"id", "model", "usage", "choices"}
+        assert set(event) <= {"id", "model", "choices"}
         for choice in event["choices"]:
             assert set(choice) == {"index", "delta", "finish_reason"}
             assert set(choice["delta"]) <= {"role", "content"}
-    assert events[-1]["usage"] == {"total_tokens": 9}
+    assert b"total_tokens" not in raw
 
 
 def logprob_provider_transport(seen_requests: list):
@@ -454,7 +455,6 @@ async def test_logprobs_requested_by_the_client_cannot_reveal_redacted_text():
     assert plain.json() == {
         "id": "c1",
         "choices": [{"index": 0, "message": {"role": "assistant", "content": "Mail [REDACTED]"}, "finish_reason": "stop"}],
-        "usage": {"total_tokens": 5},
     }
 
 
@@ -478,6 +478,8 @@ STREAM_ERROR = {"error": {"type": "upstream_error", "message": "LLM provider sen
         'data: {"choices": [{"index": 0, "delta": {}, "finish_reason": "bob@example.com"}]}',
         'data: {"choices": [{"index": -1, "delta": {"content": "x"}}]}',
         'data: {"choices": [{"index": true, "delta": {"content": "x"}}]}',
+        'data: {"choices": [{"index": 128, "delta": {"content": "x"}}]}',
+        'data: {"choices": [{"index": 4111111111111111, "delta": {"content": "x"}}]}',
         "data: not json bob@exam",
     ],
 )
@@ -601,7 +603,6 @@ LEAKY_STREAM_EXPECTED = (
         {
             "object": "chat.completion.chunk",
             "model": "m [REDACTED]",
-            "usage": {"prompt_tokens": 3},
             "choices": [{"index": 0, "delta": {"content": "Hi"}, "finish_reason": None}],
         }
     )
@@ -609,8 +610,6 @@ LEAKY_STREAM_EXPECTED = (
     + json.dumps(
         {
             "id": "c1",
-            "created": 1700000000,
-            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
             "choices": [{"index": 0, "delta": {"role": "assistant", "content": " there"}, "finish_reason": "stop"}],
         }
     )
@@ -651,14 +650,56 @@ async def test_metadata_cannot_carry_text_past_a_full_completion():
     assert response.json() == {
         "id": "[REDACTED]",
         "object": "chat.completion",
-        "created": 1,
         "model": "m",
-        "usage": {"total_tokens": 5},
         "choices": [
             {"index": 0, "message": {"role": "assistant", "content": "Mail [REDACTED]"}, "finish_reason": "stop"},
             {"index": 1, "message": {}, "finish_reason": "length"},
         ],
     }
+
+
+# A test card number and an SSN written as plain numbers. Numbers can't be redacted like text, so no
+# numeric provider metadata (`usage`, `created`) is forwarded; ordinary string metadata still is.
+CARD, SSN = 4111111111111111, 123456789
+NUMERIC_LEAKS = {"created": CARD, "usage": {"prompt_tokens": SSN, "completion_tokens": CARD, "total_tokens": CARD}}
+METADATA = {"id": "chatcmpl-9x2", "object": "chat.completion.chunk", "model": "gpt-4o-mini", "system_fingerprint": "fp_44709d6fcb"}
+
+
+async def test_numbers_in_stream_metadata_never_reach_the_client():
+    lines = [
+        "data: " + json.dumps({**METADATA, **NUMERIC_LEAKS, "choices": [
+            {"index": 0, "delta": {"role": "assistant", "content": "Mail a@b.com and card 4111 1111 1111 1111"}, "finish_reason": None}
+        ]}),
+        "data: " + json.dumps({**METADATA, **NUMERIC_LEAKS, "choices": []}),  # usage-only trailer
+        "data: [DONE]",  # flushes the held card number in a synthesized event
+    ]
+    async with gateway_client(raw_provider(lines)) as client:
+        response = await client.post("/v1/chat/completions", json=REQUEST)
+
+    expected_events = [
+        {**METADATA, "choices": [{"index": 0, "delta": {"role": "assistant", "content": "Mail [REDACTED] and card"}, "finish_reason": None}]},
+        {**METADATA, "choices": []},
+        {**METADATA, "choices": [{"index": 0, "delta": {"content": " [REDACTED]"}, "finish_reason": None}]},
+    ]
+    assert response.text == "".join(f"data: {json.dumps(event)}\n\n" for event in expected_events) + "data: [DONE]\n\n"
+    assert str(CARD) not in response.text
+    assert str(SSN) not in response.text
+
+
+async def test_numbers_in_completion_metadata_never_reach_the_client():
+    message = {"role": "assistant", "content": "SSN 123-45-6789"}
+    completion = {**METADATA, "object": "chat.completion", **NUMERIC_LEAKS, "choices": [{"index": 0, "message": message, "finish_reason": "stop"}]}
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json=completion))
+    async with gateway_client(transport) as client:
+        response = await client.post("/v1/chat/completions", json={**REQUEST, "stream": False})
+
+    assert response.json() == {
+        **METADATA,
+        "object": "chat.completion",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "SSN [REDACTED]"}, "finish_reason": "stop"}],
+    }
+    assert str(CARD) not in response.text
+    assert str(SSN) not in response.text
 
 
 INCOMPLETE = [("Contact alice@examp", "Contact "), ("SSN 123-45-", "SSN"), ("card 4111 1111 11", "card")]
@@ -728,7 +769,7 @@ async def test_empty_provider_stream_is_reported_as_interrupted():
 
 
 class StalledStream(httpx.AsyncByteStream):
-    """Sends one event and then never finishes; closing it needs an await, like a real connection."""
+    """Sends one chunk and then never finishes; closing it needs an await, like a real connection."""
 
     def __init__(self):
         self.closed = False
@@ -742,9 +783,21 @@ class StalledStream(httpx.AsyncByteStream):
         self.closed = True
 
 
-async def disconnect_after_first_chunk(app, body: bytes, client_stops_reading: bool):
-    """Drive the app the way uvicorn does (ASGI spec 2.3) and disconnect once the first body chunk is sent."""
-    first_chunk_sent = asyncio.Event()
+# How the client goes away: (ASGI spec version the server advertises, message being sent, what happens).
+# 2.3 is uvicorn's: a disconnect cancels the response. With 2.4 a failed send raises instead.
+LOST_CLIENT = {
+    "disconnect while headers are sent": ("2.3", "headers", "disconnect"),
+    "disconnect while waiting on upstream": ("2.3", "body", "disconnect_after_send"),
+    "disconnect while a chunk is sent": ("2.3", "body", "disconnect"),
+    "broken pipe on headers": ("2.4", "headers", "broken_pipe"),
+    "broken pipe on a chunk": ("2.4", "body", "broken_pipe"),
+    "request task cancelled": ("2.3", "body", "cancel"),
+}
+
+
+async def lose_client(app, headers: dict, body: bytes, spec_version: str, stage: str, action: str):
+    """Call the app as an ASGI server would, and lose the client at `stage` in the way `action` says."""
+    reached, disconnected = asyncio.Event(), asyncio.Event()
     request_sent = False
 
     async def receive():
@@ -752,18 +805,24 @@ async def disconnect_after_first_chunk(app, body: bytes, client_stops_reading: b
         if not request_sent:
             request_sent = True
             return {"type": "http.request", "body": body, "more_body": False}
-        await first_chunk_sent.wait()
+        await disconnected.wait()
         return {"type": "http.disconnect"}
 
     async def send(message):
-        if message["type"] == "http.response.body" and message["body"]:
-            first_chunk_sent.set()
-            if client_stops_reading:
-                await asyncio.Event().wait()
+        message_stage = "headers" if message["type"] == "http.response.start" else "body"
+        if message_stage != stage or not message.get("body", True):
+            return
+        reached.set()
+        if action == "broken_pipe":
+            raise BrokenPipeError
+        if action.startswith("disconnect"):
+            disconnected.set()
+        if action == "disconnect":
+            await asyncio.Event().wait()  # stuck writing to a client that is gone
 
     scope = {
         "type": "http",
-        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "asgi": {"version": "3.0", "spec_version": spec_version},
         "http_version": "1.1",
         "method": "POST",
         "scheme": "http",
@@ -771,23 +830,28 @@ async def disconnect_after_first_chunk(app, body: bytes, client_stops_reading: b
         "raw_path": b"/v1/chat/completions",
         "query_string": b"",
         "root_path": "",
-        "headers": [(b"content-type", b"application/json")],
+        "headers": [(name.lower().encode(), value.encode()) for name, value in headers.items()],
         "client": ("127.0.0.1", 5000),
         "server": ("gateway", 80),
     }
-    await asyncio.wait_for(app(scope, receive, send), timeout=2)
+    task = asyncio.create_task(app(scope, receive, send))
+    if action == "cancel":
+        await reached.wait()
+        task.cancel()
+    try:
+        await asyncio.wait_for(task, timeout=2)  # a hang fails the test (TimeoutError isn't caught)
+    except (ClientDisconnect, asyncio.CancelledError):
+        pass
 
 
-# The disconnect cancels the response while it waits on the provider (inside the event generator)
-# or while it waits on a client that stopped reading (generator paused at a yield).
-@pytest.mark.parametrize("client_stops_reading", [False, True])
-async def test_provider_response_is_closed_when_the_client_disconnects(client_stops_reading):
+@pytest.mark.parametrize("scenario", LOST_CLIENT)
+async def test_upstream_response_is_closed_however_the_client_is_lost(scenario):
     stalled = StalledStream()
     responses = [httpx.Response(200, stream=stalled)]
-    provider = httpx.MockTransport(lambda request: responses.pop() if responses else httpx.Response(200, json={"choices": []}))
-    app = create_app("http://provider.test/v1/chat/completions", http_client=httpx.AsyncClient(transport=provider))
+    upstream = httpx.MockTransport(lambda request: responses.pop() if responses else httpx.Response(200, json={"choices": []}))
+    app = create_app("http://provider.test/v1/chat/completions", http_client=httpx.AsyncClient(transport=upstream))
 
-    await disconnect_after_first_chunk(app, json.dumps(REQUEST).encode(), client_stops_reading)
+    await lose_client(app, {"content-type": "application/json"}, json.dumps(REQUEST).encode(), *LOST_CLIENT[scenario])
     assert stalled.closed
 
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gateway") as client:

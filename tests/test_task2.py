@@ -5,6 +5,7 @@ import time
 import httpx
 import jwt
 import pytest
+from starlette.requests import ClientDisconnect
 
 from task2_security_gateway import gateway, mock_downstream
 from task2_security_gateway.auth import issue_token
@@ -409,9 +410,21 @@ class StalledStream(httpx.AsyncByteStream):
         self.closed = True
 
 
-async def disconnect_after_first_chunk(app, headers: dict, body: bytes, client_stops_reading: bool):
-    """Drive the app the way uvicorn does (ASGI spec 2.3) and disconnect once the first body chunk is sent."""
-    first_chunk_sent = asyncio.Event()
+# How the client goes away: (ASGI spec version the server advertises, message being sent, what happens).
+# 2.3 is uvicorn's: a disconnect cancels the response. With 2.4 a failed send raises instead.
+LOST_CLIENT = {
+    "disconnect while headers are sent": ("2.3", "headers", "disconnect"),
+    "disconnect while waiting on upstream": ("2.3", "body", "disconnect_after_send"),
+    "disconnect while a chunk is sent": ("2.3", "body", "disconnect"),
+    "broken pipe on headers": ("2.4", "headers", "broken_pipe"),
+    "broken pipe on a chunk": ("2.4", "body", "broken_pipe"),
+    "request task cancelled": ("2.3", "body", "cancel"),
+}
+
+
+async def lose_client(app, headers: dict, body: bytes, spec_version: str, stage: str, action: str):
+    """Call the app as an ASGI server would, and lose the client at `stage` in the way `action` says."""
+    reached, disconnected = asyncio.Event(), asyncio.Event()
     request_sent = False
 
     async def receive():
@@ -419,18 +432,24 @@ async def disconnect_after_first_chunk(app, headers: dict, body: bytes, client_s
         if not request_sent:
             request_sent = True
             return {"type": "http.request", "body": body, "more_body": False}
-        await first_chunk_sent.wait()
+        await disconnected.wait()
         return {"type": "http.disconnect"}
 
     async def send(message):
-        if message["type"] == "http.response.body" and message["body"]:
-            first_chunk_sent.set()
-            if client_stops_reading:
-                await asyncio.Event().wait()
+        message_stage = "headers" if message["type"] == "http.response.start" else "body"
+        if message_stage != stage or not message.get("body", True):
+            return
+        reached.set()
+        if action == "broken_pipe":
+            raise BrokenPipeError
+        if action.startswith("disconnect"):
+            disconnected.set()
+        if action == "disconnect":
+            await asyncio.Event().wait()  # stuck writing to a client that is gone
 
     scope = {
         "type": "http",
-        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "asgi": {"version": "3.0", "spec_version": spec_version},
         "http_version": "1.1",
         "method": "POST",
         "scheme": "http",
@@ -442,23 +461,27 @@ async def disconnect_after_first_chunk(app, headers: dict, body: bytes, client_s
         "client": ("127.0.0.1", 5000),
         "server": ("gateway", 80),
     }
-    await asyncio.wait_for(app(scope, receive, send), timeout=2)
+    task = asyncio.create_task(app(scope, receive, send))
+    if action == "cancel":
+        await reached.wait()
+        task.cancel()
+    try:
+        await asyncio.wait_for(task, timeout=2)  # a hang fails the test (TimeoutError isn't caught)
+    except (ClientDisconnect, asyncio.CancelledError):
+        pass
 
 
-# The disconnect cancels the response while it waits on the downstream (inside the body generator)
-# or while it waits on a client that stopped reading (generator paused at a yield).
-@pytest.mark.parametrize("client_stops_reading", [False, True])
-async def test_upstream_response_is_closed_when_the_client_disconnects(downstream, client_stops_reading):
+@pytest.mark.parametrize("scenario", LOST_CLIENT)
+async def test_upstream_response_is_closed_however_the_client_is_lost(scenario):
     stalled = StalledStream()
-    downstream.handler = lambda request: httpx.Response(200, stream=stalled)
-    app = create_app(DOWNSTREAM_URL, SECRET, http_client=httpx.AsyncClient(transport=httpx.MockTransport(downstream)))
+    responses = [httpx.Response(200, stream=stalled)]
+    upstream = httpx.MockTransport(lambda request: responses.pop() if responses else RecordingDownstream.echo(request))
+    app = create_app(DOWNSTREAM_URL, SECRET, http_client=httpx.AsyncClient(transport=upstream))
 
-    await disconnect_after_first_chunk(
-        app, {**VIEWER, "content-type": "application/json"}, json.dumps(rpc("tools/list")).encode(), client_stops_reading
-    )
+    body = json.dumps(rpc("tools/list")).encode()
+    await lose_client(app, {**VIEWER, "content-type": "application/json"}, body, *LOST_CLIENT[scenario])
     assert stalled.closed
 
-    downstream.handler = RecordingDownstream.echo
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gateway") as client:
         response = await client.post("/mcp", json=rpc("tools/list", request_id=2), headers=VIEWER)
     assert response.json()["id"] == 2

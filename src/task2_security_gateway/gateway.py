@@ -3,7 +3,6 @@
 import json
 import logging
 import math
-from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -11,7 +10,7 @@ import anyio
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from starlette.background import BackgroundTask
+from starlette.types import Receive, Scope, Send
 
 from task2_security_gateway.auth import AuthError, Caller, caller_from_authorization
 
@@ -89,6 +88,27 @@ async def read_body(request: Request, limit: int) -> bytes | None:
     return bytes(body)
 
 
+class UpstreamStreamingResponse(StreamingResponse):
+    """Streams to the client and closes the downstream response however sending ends.
+
+    Closing here rather than in a body generator also covers a client lost before the body
+    starts (while headers are sent) and a send that raises (ASGI 2.4 `BrokenPipeError`).
+    """
+
+    def __init__(self, upstream: httpx.Response, **kwargs: Any) -> None:
+        super().__init__(upstream.aiter_bytes(), **kwargs)
+        self.upstream = upstream
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Shielded: a client disconnect arrives as cancellation, and an unshielded close would
+            # be cancelled at its first await. Bounded so a stuck close can't hang the task.
+            with anyio.move_on_after(CLOSE_TIMEOUT_SECONDS, shield=True):
+                await self.upstream.aclose()
+
+
 def is_admin_tool(name: str) -> bool:
     # Case-insensitive so "ADMIN_reset_key" can't slip past a downstream that normalizes names.
     return name.strip().lower().startswith("admin_")
@@ -126,30 +146,11 @@ async def forward(client: httpx.AsyncClient, downstream_url: str, message: dict,
         logger.error("downstream request failed url=%s error=%r", downstream_url, exc)
         return jsonrpc_error(request_id, DOWNSTREAM_UNAVAILABLE, "Downstream MCP server unavailable", status_code=502)
 
-    async def body() -> AsyncIterator[bytes]:
-        # Close the upstream response however streaming ends. A read error after the headers are
-        # sent propagates, so the server aborts the connection instead of ending a truncated body cleanly.
-        try:
-            async for chunk in upstream.aiter_bytes():
-                yield chunk
-        finally:
-            # Shielded: a client disconnect cancels this task, and an unshielded close would be
-            # cancelled at its first await. Bounded so a stuck close can't hang the task.
-            with anyio.move_on_after(CLOSE_TIMEOUT_SECONDS, shield=True):
-                await upstream.aclose()
-
-    chunks = body()
-
-    async def close_chunks() -> None:
-        # A disconnect can stop the response while `chunks` is paused at a yield, where its
-        # `finally` wouldn't run until garbage collection; closing it here runs it right away.
-        await chunks.aclose()
-
     response_headers = {name: upstream.headers[name] for name in FORWARDED_RESPONSE_HEADERS if name in upstream.headers}
-    # Stream through so SSE responses from streamable-HTTP servers pass unchanged.
-    return StreamingResponse(
-        chunks, status_code=upstream.status_code, headers=response_headers, background=BackgroundTask(close_chunks)
-    )
+    # Stream through so SSE responses from streamable-HTTP servers pass unchanged. A read error after
+    # the headers are sent propagates, so the server aborts the connection instead of ending a
+    # truncated body cleanly.
+    return UpstreamStreamingResponse(upstream, status_code=upstream.status_code, headers=response_headers)
 
 
 def create_app(downstream_url: str, jwt_secret: str, http_client: httpx.AsyncClient | None = None) -> FastAPI:

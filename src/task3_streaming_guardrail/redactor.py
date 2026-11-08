@@ -19,9 +19,13 @@ EMAIL = LOCAL_PART + r"@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z
 # [0-9] instead of \d so non-ASCII digits don't widen the match.
 SSN = r"(?<![0-9])[0-9]{3}-[0-9]{2}-[0-9]{4}(?![0-9])"
 # A whole run of 13-48 digits with optional single space/dash separators. Matching the
-# full run (not just 13-19 digits) lets redact_digit_run find a card or SSN inside it.
+# full run (not just 13-19 digits) lets sensitive_spans find a card or SSN inside it.
 DIGIT_RUN = r"(?<![0-9])[0-9](?:[ -]?[0-9]){12,47}(?![0-9])"
-PII_PATTERN = re.compile(f"(?P<email>{EMAIL})|(?P<ssn>{SSN})|(?P<digits>{DIGIT_RUN})")
+# Emails and numbers are searched separately and their redactions merged. In one alternation the
+# leftmost match wins, so the digit run in "2024 01 15 12345@example.com" would swallow the
+# email's local part; searching emails first instead would hide most of "4111 1111 1111 1111@x.com".
+EMAIL_PATTERN = re.compile(EMAIL)
+NUMBER_PATTERN = re.compile(f"{SSN}|{DIGIT_RUN}")
 SSN_PATTERN = re.compile(SSN)
 
 EMAIL_CHARS = frozenset(string.ascii_letters + string.digits + LOCAL_PART_SYMBOLS + "@")
@@ -29,8 +33,9 @@ NUMBER_CHARS = frozenset(string.digits + " -")
 
 # Longest possible match: an email of 64 + 1 + 63 + 8 * 64 + 1 + 63 = 704 chars (a digit run is
 # at most 95). Holding back at least that much means text already sent can never turn out to be
-# the start of a match. Because a cut never splits a match, `pending` can reach
-# MAX_HOLDBACK + 703 = 1,407 chars after a feed, per choice.
+# the start of a match. A cut never splits a match: an email crossing the window can start 703
+# chars before it, and a digit run ending in that email's local part 94 chars before that, so
+# `pending` can reach MAX_HOLDBACK + 703 + 94 = 1,501 chars after a feed, per choice.
 MAX_HOLDBACK = 704
 
 
@@ -44,12 +49,20 @@ def luhn_valid(digits: str) -> bool:
     return total % 10 == 0
 
 
-def redact_digit_run(run: str) -> str:
+def find_pii(text: str) -> list[re.Match]:
+    """Every email and every SSN/digit-run match. An email can overlap a digit run ending in its local part."""
+    return [*EMAIL_PATTERN.finditer(text), *NUMBER_PATTERN.finditer(text)]
+
+
+def sensitive_spans(match: re.Match) -> list[tuple[int, int]]:
+    if match.re is EMAIL_PATTERN:
+        return [match.span()]
     # A card or SSN can sit next to unrelated digits, e.g. "4111 1111 1111 1111 12/26" or
     # "555 123 4567 123-45-6789". Redact every SSN and every sequence of whole digit groups
     # that forms a Luhn-valid 13-19 digit card; other digits (order IDs, phones) stay.
-    sensitive = [match.span() for match in SSN_PATTERN.finditer(run)]
-    groups = [match.span() for match in re.finditer(r"[0-9]+", run)]
+    run, offset = match.group(), match.start()
+    sensitive = [ssn.span() for ssn in SSN_PATTERN.finditer(run)]
+    groups = [group.span() for group in re.finditer(r"[0-9]+", run)]
     for first in range(len(groups)):
         digits = ""
         for start, end in groups[first:]:
@@ -58,28 +71,27 @@ def redact_digit_run(run: str) -> str:
                 break
             if len(digits) >= 13 and luhn_valid(digits):
                 sensitive.append((groups[first][0], end))
+    return [(offset + start, offset + end) for start, end in sensitive]
 
-    masked = [False] * len(run)
-    for start, end in sensitive:
-        masked[start:end] = [True] * (end - start)
 
-    output = []
-    for index, char in enumerate(run):
-        if not masked[index]:
-            output.append(char)
-        elif index == 0 or not masked[index - 1]:
-            output.append(REDACTED)
+def redact_matches(text: str, matches: list[re.Match]) -> str:
+    """Replace each stretch covered by overlapping sensitive spans with one [REDACTED]."""
+    merged: list[list[int]] = []
+    for start, end in sorted(span for match in matches for span in sensitive_spans(match)):
+        if merged and start < merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    output, position = [], 0
+    for start, end in merged:
+        output += [text[position:start], REDACTED]
+        position = end
+    output.append(text[position:])
     return "".join(output)
 
 
-def replacement(match: re.Match) -> str:
-    if match.lastgroup == "digits":
-        return redact_digit_run(match.group())
-    return REDACTED
-
-
 def redact_text(text: str) -> str:
-    return PII_PATTERN.sub(replacement, text)
+    return redact_matches(text, find_pii(text))
 
 
 def trailing_run_start(text: str, allowed: frozenset[str]) -> int:
@@ -105,17 +117,11 @@ class StreamRedactor:
         return self._emit_until(len(self.pending))
 
     def _emit_until(self, cut: int) -> str:
-        output = []
-        position = 0
-        for match in PII_PATTERN.finditer(self.pending):
-            if match.end() > cut:
-                # Never cut through a match; hold the whole value until it's complete.
-                cut = min(cut, match.start())
-                break
-            output.append(self.pending[position : match.start()])
-            output.append(replacement(match))
-            position = match.end()
-
-        output.append(self.pending[position:cut])
+        matches = find_pii(self.pending)
+        # Never cut through a match; hold the whole value until it's complete. Moving the cut back to
+        # an email's start can put it inside a digit run that ends in the local part, so repeat.
+        while crossing := [match.start() for match in matches if match.start() < cut < match.end()]:
+            cut = min(crossing)
+        output = redact_matches(self.pending[:cut], [match for match in matches if match.end() <= cut])
         self.pending = self.pending[cut:]
-        return "".join(output)
+        return output

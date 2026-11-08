@@ -209,12 +209,15 @@ algorithm list is pinned, so the role can't be self-asserted. Other points:
 of characters that could still become part of a match: email characters, or digits/spaces/dashes for SSNs and
 cards. Everything before that is redacted and sent immediately, so the extra latency is roughly one word. The
 hold-back is capped at 704 characters, the longest string any pattern can match, so text that has been sent can
-never turn out to be the start of a match. The cut never goes through a match, so the buffer holds at most
-704 + 703 = 1,407 characters per choice after each chunk. Tests check that streaming output is identical to
-redacting the full text at once, including 2,000 seeded adversarial inputs. Digits are matched as whole runs (up to
-48 digits) and then checked inside, so a card or SSN next to unrelated digits (`4111 1111 1111 1111 12/26`) is still
-found. Email local parts accept the RFC 5322 characters (`o'connor`, `a!b`) but must start with a letter or digit, so
-Markdown around an address (`**bob@x.com**`) is kept.
+never turn out to be the start of a match. The cut never goes through a match: an email crossing the window can
+start 703 characters before it, and a digit run ending in that email's first character 94 before that, so the
+buffer holds at most 704 + 703 + 94 = 1,501 characters per choice after each chunk. Tests check that streaming
+output is identical to redacting the full text at once, including 2,000 seeded adversarial inputs. Digits are matched
+as whole runs (up to 48 digits) and then checked inside, so a card or SSN next to unrelated digits
+(`4111 1111 1111 1111 12/26`) is still found. Emails and digit runs are searched separately and every part either
+flags is redacted, so a run that ends inside an email (`2024 01 15 12345@example.com`) can't hide it. Email local
+parts accept the RFC 5322 characters (`o'connor`, `a!b`) but must start with a letter or digit, so Markdown around an
+address (`**bob@x.com**`) is kept.
 
 The SSE layer rebuilds each event rather than filtering it. Per choice it keeps `index`, `finish_reason` and a
 `delta` with the redacted `content` (plus `role` if it is `assistant`). At the top level it keeps `id`, `object`,
@@ -279,7 +282,7 @@ complete. The provider response is closed however the stream ends, the same way 
   clients asking for `logprobs` or tools get none back. A provider that never sends `finish_reason` or `[DONE]`
   always ends with an error, and a `finish_reason` newer than the ones listed counts as malformed. The prompt isn't
   redacted. Clients get no `usage` or `created` from the provider. Assumes OpenAI-style single-line `data:`
-  events; the 1,407-char bound is per choice (at most 128 choices), and the size of a single provider event line
+  events; the 1,501-char bound is per choice (at most 128 choices), and the size of a single provider event line
   isn't capped.
 - **Task 4**: the byte estimate is deliberately pessimistic, not a real tokenizer. English prompts reserve about
   4x their real token count (CJK about 2-3x) until the request settles, so a tenant can get 429s while actual usage

@@ -107,10 +107,11 @@ def test_random_chunk_boundaries_match_whole_text_redaction(seed):
 
 
 def test_adversarial_inputs_stream_the_same_as_whole_text():
-    # Glued tokens with no separators, stray @ and -, PII next to digits, non-ASCII digits.
+    # Glued tokens with no separators, stray @ and -, PII next to digits, emails after digit runs, non-ASCII digits.
     tokens = ["a", "Z", "0", "7", "-", " ", ".", "@", "_", "+", "x@y.co", "123-45-6789", "4111 1111 1111 1111",
               "4111111111111111", "b@c.org", "\n", ",", "foo", "99", "4242-4242-4242-4242", "é", "١", "12/26",
-              "555 123 4567", "'", "!", "*", "`", "=", "o'c", "{x}", "~", "#"]
+              "555 123 4567", "'", "!", "*", "`", "=", "o'c", "{x}", "~", "#", "12345@example.com", "2024 01 15",
+              "77@b.org", "@x.com"]
     failures = []
     for seed in range(2000):
         rng = random.Random(seed)
@@ -157,6 +158,38 @@ def test_whole_email_local_part_is_redacted(text, expected):
         assert stream_through(text, split_every(text, size)) == expected
 
 
+N01 = "Booked 2024 01 15 12345@example.com"
+N01_REDACTED = "Booked 2024 01 15 [REDACTED]"
+
+# A digit run of 13+ digits can end inside an email's local part; both must still be checked.
+EMAIL_NEXT_TO_DIGITS = [
+    (N01, N01_REDACTED),
+    ("On 2024-01-15 98765@mail.example.org confirmed", "On 2024-01-15 [REDACTED] confirmed"),
+    ("Call 555 123 4567 1234@example.com today", "Call 555 123 4567 [REDACTED] today"),
+    ("Ref 12 34 123-45-6789 7@example.com", "Ref 12 34 [REDACTED] [REDACTED]"),
+    ("SSN 123-45-6789 42@example.com", "SSN [REDACTED] [REDACTED]"),
+    ("Card 4111 1111 1111 1111 99@example.com", "Card [REDACTED] [REDACTED]"),
+    ("Pay 4111 1111 1111 1111@x.com", "Pay [REDACTED]"),  # the card's last group is also the local part
+    ("From 2024 01 15 12345@a.com to 2024 02 20 67890@b.org", "From 2024 01 15 [REDACTED] to 2024 02 20 [REDACTED]"),
+    # No PII: dates, order numbers and phone-like groups stay, even when 13+ digits form one run.
+    ("Booked 2024 01 15 12345 at example.com", "Booked 2024 01 15 12345 at example.com"),
+    ("Order 1234567890123 shipped 2024-01-15, ref 2024 01 15 12345", "Order 1234567890123 shipped 2024-01-15, ref 2024 01 15 12345"),
+    ("Call 555 123 4567 1234 today; v2.0.1@latest", "Call 555 123 4567 1234 today; v2.0.1@latest"),
+]
+
+
+@pytest.mark.parametrize("text, expected", EMAIL_NEXT_TO_DIGITS)
+def test_email_after_digits_is_redacted(text, expected):
+    assert redact_text(text) == expected
+    for size in (1, 2, 3):
+        assert stream_through(text, split_every(text, size)) == expected
+
+
+@pytest.mark.parametrize("cut", range(len(N01) + 1))
+def test_email_after_digits_is_redacted_for_every_two_chunk_split(cut):
+    assert stream_through(N01, [N01[:cut], N01[cut:]]) == N01_REDACTED
+
+
 def test_emails_longer_than_the_old_256_char_cap_are_not_released_early():
     # Six 63-digit labels: a 400-char string the email pattern accepts once ".com" arrives.
     email = "bob@" + ".".join(str(digit) * 63 for digit in range(1, 7)) + ".com"
@@ -167,19 +200,23 @@ def test_emails_longer_than_the_old_256_char_cap_are_not_released_early():
 
 def test_pending_buffer_bound_matches_documented_limit():
     # Longest email the pattern allows: 64 + 1 + 63 + 8 * 64 + 1 + 63 = 704 chars. The buffer may hold
-    # one held-back window plus one match crossing it: 704 + 703 = 1,407 chars after any feed.
+    # one held-back window, an email crossing it (703 more) and a 95-char digit run ending in that
+    # email's first character (94 more): 1,501 chars after any feed.
     longest = "a" * 64 + "@" + ".".join(["b" * 63] * 9) + "." + "c" * 63
     assert len(longest) == 704 == MAX_HOLDBACK
     assert redact_text(f"<{longest}>") == "<[REDACTED]>"
+    run = "9 " * 47  # with the email's leading "1", a run of 48 digits
+    worst = "z" + run + "1" + longest[1:] + "d" * 1000
+    assert redact_text(worst) == "z" + run + "[REDACTED]" + "d" * 1000
     peak = 0
     redactor = StreamRedactor()
     emitted = []
-    for text in ["z" * 703 + longest, longest + "d" * 2000, ("x" * 63 + longest) * 3]:
+    for text in ["z" * 703 + longest, longest + "d" * 2000, ("x" * 63 + longest) * 3, worst]:
         for chunk in split_every(text, 1):
             emitted.append(redactor.feed(chunk))
             peak = max(peak, len(redactor.pending))
     emitted.append(redactor.flush())
-    assert peak <= 1407
+    assert peak == 1501
     assert "b" * 63 not in "".join(emitted)
 
 
@@ -700,6 +737,41 @@ async def test_numbers_in_completion_metadata_never_reach_the_client():
     }
     assert str(CARD) not in response.text
     assert str(SSN) not in response.text
+
+
+N01_METADATA = {"id": "chatcmpl-1", "object": "chat.completion.chunk", "model": N01, "system_fingerprint": N01}
+N01_METADATA_REDACTED = {**N01_METADATA, "model": N01_REDACTED, "system_fingerprint": N01_REDACTED}
+
+
+async def test_email_after_digits_is_redacted_in_stream_content_and_metadata():
+    lines = [
+        "data: " + json.dumps({**N01_METADATA, "choices": [{"index": 0, "delta": {"content": "Booked 2024 01 15 123"}, "finish_reason": None}]}),
+        "data: " + json.dumps({**N01_METADATA, "choices": [{"index": 0, "delta": {"content": "45@example.com"}, "finish_reason": "stop"}]}),
+        "data: [DONE]",
+    ]
+    async with gateway_client(raw_provider(lines)) as client:
+        response = await client.post("/v1/chat/completions", json=REQUEST)
+
+    # The digits are held until the email completes; the finish reason flushes the rest.
+    expected_events = [
+        {**N01_METADATA_REDACTED, "choices": [{"index": 0, "delta": {"content": "Booked"}, "finish_reason": None}]},
+        {**N01_METADATA_REDACTED, "choices": [{"index": 0, "delta": {"content": " 2024 01 15 [REDACTED]"}, "finish_reason": "stop"}]},
+    ]
+    assert response.text == "".join(f"data: {json.dumps(event)}\n\n" for event in expected_events) + "data: [DONE]\n\n"
+
+
+async def test_email_after_digits_is_redacted_in_completion_content_and_metadata():
+    message = {"role": "assistant", "content": N01}
+    completion = {**N01_METADATA, "object": "chat.completion", "choices": [{"index": 0, "message": message, "finish_reason": "stop"}]}
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json=completion))
+    async with gateway_client(transport) as client:
+        response = await client.post("/v1/chat/completions", json={**REQUEST, "stream": False})
+
+    assert response.json() == {
+        **N01_METADATA_REDACTED,
+        "object": "chat.completion",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": N01_REDACTED}, "finish_reason": "stop"}],
+    }
 
 
 INCOMPLETE = [("Contact alice@examp", "Contact "), ("SSN 123-45-", "SSN"), ("card 4111 1111 11", "card")]

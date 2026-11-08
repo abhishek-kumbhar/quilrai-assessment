@@ -2,13 +2,16 @@
 
 import json
 import logging
+import math
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
+import anyio
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from task2_security_gateway.auth import AuthError, Caller, caller_from_authorization
 
@@ -22,6 +25,7 @@ UNAUTHORIZED_TOOL_CALL = -32001
 DOWNSTREAM_UNAVAILABLE = -32002
 
 MAX_BODY_BYTES = 1_000_000
+CLOSE_TIMEOUT_SECONDS = 5
 # The caller's Authorization header is deliberately not forwarded (no token passthrough).
 FORWARDED_REQUEST_HEADERS = ("accept", "mcp-session-id", "mcp-protocol-version", "last-event-id")
 FORWARDED_RESPONSE_HEADERS = ("content-type", "mcp-session-id")
@@ -32,6 +36,22 @@ def jsonrpc_error(request_id: Any, code: int, message: str, status_code: int = 2
     # the request id instead of treating them as transport failures.
     body = {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
     return JSONResponse(body, status_code=status_code, headers=headers)
+
+
+def reject_constant(name: str) -> None:
+    raise ValueError(f"{name} is not valid JSON")
+
+
+def finite_float(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):  # e.g. 1e999, which would be re-sent as the non-JSON token Infinity
+        raise ValueError(f"{text} is out of range")
+    return value
+
+
+def parse_json(body: bytes) -> Any:
+    # Python's json module accepts NaN/Infinity by default; RFC 8259 JSON doesn't.
+    return json.loads(body, parse_constant=reject_constant, parse_float=finite_float)
 
 
 def is_valid_id(value: Any) -> bool:
@@ -94,7 +114,7 @@ async def forward(client: httpx.AsyncClient, downstream_url: str, message: dict,
     headers["content-type"] = "application/json"
     # Re-serialize the parsed message instead of forwarding raw bytes, so the downstream
     # sees exactly what was authorized (e.g. no duplicate "name" keys parsed differently).
-    upstream_request = client.build_request("POST", downstream_url, content=json.dumps(message), headers=headers)
+    upstream_request = client.build_request("POST", downstream_url, content=json.dumps(message, allow_nan=False), headers=headers)
     request_id = message.get("id")
 
     try:
@@ -113,11 +133,23 @@ async def forward(client: httpx.AsyncClient, downstream_url: str, message: dict,
             async for chunk in upstream.aiter_bytes():
                 yield chunk
         finally:
-            await upstream.aclose()
+            # Shielded: a client disconnect cancels this task, and an unshielded close would be
+            # cancelled at its first await. Bounded so a stuck close can't hang the task.
+            with anyio.move_on_after(CLOSE_TIMEOUT_SECONDS, shield=True):
+                await upstream.aclose()
+
+    chunks = body()
+
+    async def close_chunks() -> None:
+        # A disconnect can stop the response while `chunks` is paused at a yield, where its
+        # `finally` wouldn't run until garbage collection; closing it here runs it right away.
+        await chunks.aclose()
 
     response_headers = {name: upstream.headers[name] for name in FORWARDED_RESPONSE_HEADERS if name in upstream.headers}
     # Stream through so SSE responses from streamable-HTTP servers pass unchanged.
-    return StreamingResponse(body(), status_code=upstream.status_code, headers=response_headers)
+    return StreamingResponse(
+        chunks, status_code=upstream.status_code, headers=response_headers, background=BackgroundTask(close_chunks)
+    )
 
 
 def create_app(downstream_url: str, jwt_secret: str, http_client: httpx.AsyncClient | None = None) -> FastAPI:
@@ -125,8 +157,11 @@ def create_app(downstream_url: str, jwt_secret: str, http_client: httpx.AsyncCli
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        yield
-        await client.aclose()
+        try:
+            yield
+        finally:
+            if http_client is None:  # an injected client belongs to the caller
+                await client.aclose()
 
     app = FastAPI(title="MCP Security Gateway", lifespan=lifespan)
 
@@ -144,7 +179,7 @@ def create_app(downstream_url: str, jwt_secret: str, http_client: httpx.AsyncCli
             return jsonrpc_error(None, INVALID_REQUEST, "Request body too large", status_code=413)
 
         try:
-            message = json.loads(body)
+            message = parse_json(body)
         except ValueError:
             return jsonrpc_error(None, PARSE_ERROR, "Parse error", status_code=400)
 

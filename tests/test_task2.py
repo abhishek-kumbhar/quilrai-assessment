@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 
@@ -5,7 +6,7 @@ import httpx
 import jwt
 import pytest
 
-from task2_security_gateway import mock_downstream
+from task2_security_gateway import gateway, mock_downstream
 from task2_security_gateway.auth import issue_token
 from task2_security_gateway.gateway import create_app
 
@@ -351,6 +352,142 @@ async def test_upstream_response_is_closed_after_success(downstream):
         response = await client.post("/mcp", json=rpc("tools/list"), headers=VIEWER)
     assert response.json() == {"jsonrpc": "2.0", "id": 1, "result": {}}
     assert closed == [True]
+
+
+PARSE_ERROR = {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"cursor": NaN}}',
+        b'{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"cursor": Infinity}}',
+        b'{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"cursor": -Infinity}}',
+        b'{"jsonrpc": "2.0", "id": NaN, "method": "tools/list"}',
+        b'{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"cursor": 1e999}}',
+        b'{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"cursor": -1e999}}',
+        b'{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "get_customer_record", "arguments": {"x": NaN}}}',
+    ],
+)
+async def test_non_standard_json_numbers_are_parse_errors(client, downstream, body):
+    # Python's json module accepts these by default and would re-send them as NaN/Infinity tokens.
+    response = await client.post("/mcp", content=body, headers=VIEWER)
+
+    assert response.status_code == 400
+    assert response.json() == PARSE_ERROR
+    assert downstream.requests == []
+
+
+async def test_authentication_is_still_checked_before_parsing(client, downstream):
+    response = await client.post("/mcp", content=b'{"jsonrpc": "2.0", "id": 1, "params": NaN}')
+    assert response.status_code == 401
+    assert downstream.requests == []
+
+
+async def test_finite_numbers_are_forwarded_unchanged(client, downstream):
+    raw = b'{"jsonrpc": "2.0", "id": 0, "method": "tools/list", "params": {"a": 1.5, "b": 1e308, "c": -0.0, "d": 12345678901234567890}}'
+    response = await client.post("/mcp", content=raw, headers=VIEWER)
+
+    assert response.status_code == 200
+    assert downstream.requests[0].content == (
+        b'{"jsonrpc": "2.0", "id": 0, "method": "tools/list", "params": {"a": 1.5, "b": 1e+308, "c": -0.0, "d": 12345678901234567890}}'
+    )
+
+
+class StalledStream(httpx.AsyncByteStream):
+    """Sends one chunk and then never finishes; closing it needs an await, like a real connection."""
+
+    def __init__(self):
+        self.closed = False
+
+    async def __aiter__(self):
+        yield b'{"jsonrpc": "2.0", '
+        await asyncio.Event().wait()
+
+    async def aclose(self):
+        await asyncio.sleep(0)
+        self.closed = True
+
+
+async def disconnect_after_first_chunk(app, headers: dict, body: bytes, client_stops_reading: bool):
+    """Drive the app the way uvicorn does (ASGI spec 2.3) and disconnect once the first body chunk is sent."""
+    first_chunk_sent = asyncio.Event()
+    request_sent = False
+
+    async def receive():
+        nonlocal request_sent
+        if not request_sent:
+            request_sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        await first_chunk_sent.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if message["type"] == "http.response.body" and message["body"]:
+            first_chunk_sent.set()
+            if client_stops_reading:
+                await asyncio.Event().wait()
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/mcp",
+        "raw_path": b"/mcp",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(name.lower().encode(), value.encode()) for name, value in headers.items()],
+        "client": ("127.0.0.1", 5000),
+        "server": ("gateway", 80),
+    }
+    await asyncio.wait_for(app(scope, receive, send), timeout=2)
+
+
+# The disconnect cancels the response while it waits on the downstream (inside the body generator)
+# or while it waits on a client that stopped reading (generator paused at a yield).
+@pytest.mark.parametrize("client_stops_reading", [False, True])
+async def test_upstream_response_is_closed_when_the_client_disconnects(downstream, client_stops_reading):
+    stalled = StalledStream()
+    downstream.handler = lambda request: httpx.Response(200, stream=stalled)
+    app = create_app(DOWNSTREAM_URL, SECRET, http_client=httpx.AsyncClient(transport=httpx.MockTransport(downstream)))
+
+    await disconnect_after_first_chunk(
+        app, {**VIEWER, "content-type": "application/json"}, json.dumps(rpc("tools/list")).encode(), client_stops_reading
+    )
+    assert stalled.closed
+
+    downstream.handler = RecordingDownstream.echo
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gateway") as client:
+        response = await client.post("/mcp", json=rpc("tools/list", request_id=2), headers=VIEWER)
+    assert response.json()["id"] == 2
+
+
+@pytest.mark.parametrize("fails", [False, True])
+async def test_lifespan_closes_only_the_client_it_created(monkeypatch, fails):
+    created = []
+
+    class RecordedClient(httpx.AsyncClient):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            created.append(self)
+
+    injected = httpx.AsyncClient()
+    monkeypatch.setattr(gateway.httpx, "AsyncClient", RecordedClient)
+    owned_app = create_app(DOWNSTREAM_URL, SECRET)
+    injected_app = create_app(DOWNSTREAM_URL, SECRET, http_client=injected)
+
+    for app in (owned_app, injected_app):
+        try:
+            async with app.router.lifespan_context(app):
+                if fails:
+                    raise RuntimeError("startup failed after the client was created")
+        except RuntimeError:
+            pass
+    assert [client.is_closed for client in created] == [True]
+    assert not injected.is_closed
+    await injected.aclose()
 
 
 async def test_sse_responses_and_session_headers_pass_through(downstream):

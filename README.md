@@ -139,7 +139,7 @@ Settings: `PRIMARY_URL`, `SECONDARY_URL`, `PRIMARY_MODEL`, `SECONDARY_MODEL`, `P
 ## Tests
 
 ```bash
-uv run pytest                     # everything (~7s, one test deliberately waits for the real 3s timeout)
+uv run pytest                     # everything (~9s, one test deliberately waits for the real 3s timeout)
 uv run pytest tests/test_task3.py # one task
 ```
 
@@ -268,5 +268,8 @@ that will never complete. The provider response is closed in a `finally` however
   byte-level tokenizer and only allows 4 tokens per message for chat formatting; tokens a provider adds itself
   (hidden system prompts, tool definitions) aren't covered, so reported usage can still exceed the reservation,
   in which case the window briefly holds more than the limit and later requests are blocked until it drains.
-  If a request is cancelled mid-flight its reservation stays at the estimate. One SQLite write lock serializes all reservations: fine for a single gateway node, not for a
-  horizontally scaled fleet (use Redis or similar there). Only non-streaming completions are routed.
+  If a request is cancelled mid-flight its reservation stays at the estimate. If the primary fails and the backup
+  answers, only the backup's reported usage is charged. The 3s deadline relies on asyncio cancellation (not a hard
+  real-time guarantee) and covers the provider call, not the wait for the SQLite lock. One SQLite write lock
+  serializes all reservations: fine for a single gateway node, not for a horizontally scaled fleet (use Redis or
+  similar there). Only non-streaming completions are routed.

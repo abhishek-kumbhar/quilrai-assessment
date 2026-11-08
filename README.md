@@ -146,23 +146,25 @@ uv run pytest tests/test_task3.py # one task
 What they cover, briefly:
 
 - **Task 1**: valid calls, a table of bad customer IDs / amounts / reasons, missing and extra fields, unknown tool,
-  `isError` vs JSON-RPC error, a raw subprocess session asserting every stdout line is JSON-RPC and logs land on
+  exactly-10-character reasons, sub-cent, successive and too-small refunds, `isError` vs JSON-RPC error, a raw subprocess session asserting every stdout line is JSON-RPC and logs land on
   stderr, -32700 for unparseable input, and the official SDK client talking to the server.
 - **Task 2**: viewer vs admin, case tricks (`ADMIN_x`), 18 kinds of bad credentials (expired, wrong secret,
   `alg: none`, forged payload, non-string role, ...), malformed bodies and envelopes (bad id types, non-object
-  params, `result` and `error` together), batches, duplicate-key smuggling, oversized streamed bodies, downstream
-  down/timeout/broken mid-stream, SSE passthrough. Every rejection asserts the downstream received nothing.
+  params, `result` and `error` together), `NaN`/`Infinity`/`1e999`, batches, duplicate-key smuggling, oversized
+  streamed bodies, downstream down/timeout/broken mid-stream, client disconnects, SSE passthrough, and which HTTP
+  client the app closes. Every rejection asserts the downstream received nothing.
 - **Task 3**: detection against hand-written expected outputs (including cards and SSNs next to other digits),
   streaming output equal to whole-text redaction for many chunk sizes, 200 random chunkings and 2,000 seeded
   adversarial inputs, PII split at every kind of boundary, long-input speed and bounded buffer, first output
   emitted before the provider finishes, SSE format preserved, multiple choices, provider errors, RFC 5322 email
-  local parts, the documented buffer bound, `logprobs`/refusal/tool-call fields never reaching the client,
-  malformed provider events, and the provider response being closed on every exit path.
+  local parts, the documented buffer bound, `logprobs`/refusals/tool calls/extra metadata/SSE comments never
+  reaching the client, malformed provider events, streams that end without `finish_reason` or `[DONE]`, and the
+  provider response being closed on every exit path, including a client disconnect.
 - **Task 4**: window boundaries with a fake clock, eviction from disk, persistence across instances, 40 threads and
   30 concurrent HTTP requests against one budget, admission time taken after a held SQLite lock is released,
-  provider usage that is a bool/float/string/negative/huge, fallback on 429/timeout/5xx/network/bad JSON, no
-  fallback on 400, both providers failing, client closed on shutdown, and error payloads that never contain
-  upstream details.
+  provider usage that is a bool/float/string/negative/huge or above the budget (also after the budget is raised),
+  fallback on 429/timeout/5xx/network/bad JSON, no fallback on 400, both providers failing, client closed on normal
+  and failed shutdown, and error payloads that never contain upstream details.
 
 ## Design decisions
 
@@ -172,8 +174,10 @@ failures into `isError` tool results, and the assessment asks for JSON-RPC error
 - valid request but the operation fails (unknown customer, refund above balance) → `result.isError = true`.
 
 Pydantic models are `strict` (no `"10"` → 10 coercion) with `extra="forbid"`. The refund rules are exactly the
-assessment's: `amount` is any finite positive number and `reason` has at least 10 characters, not counting surrounding
-whitespace (so 20 spaces isn't a reason). Customer IDs use `[0-9]` instead of
+assessment's: `amount` is any finite positive number and `reason` has at least 10 characters as written. The
+balance is reduced by subtracting decimals (so 75.5 - 0.1 is 75.4, not 75.39999999999999); a refund too small to
+change the stored balance (1e-15 from 75.5) is a business error instead of a "processed" refund that changed
+nothing. Customer IDs use `[0-9]` instead of
 `\d` because pydantic's regex engine treats `\d` as any Unicode digit. The SDK's stdio transport silently drops
 lines it can't parse; a small filter in front of the server answers those with `-32700`/`-32600` as JSON-RPC
 expects, echoing the request id when it can be read. The SDK also redirects fd 1 to stderr while serving, so even a stray `print` can't corrupt the protocol
@@ -185,11 +189,16 @@ algorithm list is pinned, so the role can't be self-asserted. Other points:
   keys could be read one way by the gateway and another way by the downstream.
 - Batches are rejected (MCP no longer supports them) so an admin call can't hide inside an array.
 - `admin_` is matched case-insensitively after trimming whitespace.
+- JSON is parsed strictly: `NaN`, `Infinity` and numbers that overflow to infinity (`1e999`) are `-32700`, so what
+  is forwarded is always standard JSON.
 - The envelope is checked before anything is forwarded: `jsonrpc` is `"2.0"`, ids are strings or integers,
   `params` is an object, and client responses carry exactly one of `result`/`error`. The 1 MB body limit is
   enforced while reading, so an oversized body is cut off rather than buffered.
-- The downstream response is streamed through and always closed. If it breaks after headers were sent, the
-  client connection is aborted rather than ended as if the body were complete.
+- The downstream response is streamed through and closed however it ends. If it breaks after headers were sent,
+  the client connection is aborted rather than ended as if the body were complete. A client disconnect cancels the
+  stream, so the close is shielded from that cancellation (and bounded at 5s), and a response stopped between
+  chunks is closed explicitly rather than left to garbage collection.
+- The HTTP client the app creates is closed on shutdown, also when startup fails; an injected one is left to its owner.
 - The caller's `Authorization` header is not forwarded downstream (no token passthrough).
 - HTTP status: 401 for bad credentials, 400 for unparseable/invalid JSON-RPC, 200 with a JSON-RPC error for
   `-32001`/`-32602` (so MCP clients match it to the request id), 502/504 if the downstream is unreachable.
@@ -205,14 +214,19 @@ redacting the full text at once, including 2,000 seeded adversarial inputs. Digi
 found. Email local parts accept the RFC 5322 characters (`o'connor`, `a!b`) but must start with a letter or digit, so
 Markdown around an address (`**bob@x.com**`) is kept.
 
-The SSE layer forwards an allowlist: per choice only `index`, `finish_reason` and a `delta` with `role` and the
-redacted `content`, plus top-level `id`/`object`/`created`/`model`/`system_fingerprint`/`usage`. Everything else
-(`logprobs`, tool calls, refusals, audio, unknown fields) is dropped, because it can repeat the generated text in
-a form that isn't redacted; `logprobs` tokens and byte arrays would otherwise spell out a redacted email. The
-non-streaming path applies the same allowlist to `message`. Held text is flushed on `finish_reason`, `[DONE]`, or
-end of stream. An event that isn't JSON or doesn't have that shape, or a broken provider connection, ends the
-stream with a sanitized error event; the held tail is dropped then, because it may be the first half of an email
-that will never complete. The provider response is closed in a `finally` however the stream ends.
+The SSE layer rebuilds each event rather than filtering it. Per choice it keeps `index`, `finish_reason` and a
+`delta` with the redacted `content` (plus `role` if it is `assistant`). At the top level it keeps `id`, `object`,
+`model` and `system_fingerprint` if they are strings (redacted as well, since a provider could echo text into any of
+them), `created` if it is an integer, and the integer counts in `usage`. Everything else is dropped: `logprobs`,
+tool calls, refusals, audio, nested or unknown fields, and SSE comments and `id:`/`event:` lines. Those can repeat
+the generated text in a form that isn't redacted (`logprobs` byte arrays would spell out a redacted email). The
+non-streaming path rebuilds `message` the same way. A choice with a non-integer `index`, an unknown
+`finish_reason`, or content that isn't a string is treated as malformed.
+
+Held text is flushed when a choice gets a `finish_reason` or the provider sends `[DONE]`. A body that just ends
+without either is treated as incomplete, the same as a broken connection or a malformed event: the stream ends with
+a sanitized error event and the held tail is dropped, because it may be the first half of an email that will never
+complete. The provider response is closed however the stream ends, including a client disconnect (as in Task 2).
 
 **Task 4.**
 - Rate limiter is a sliding log: one SQLite row per request (`tenant`, `tokens`, `created_at`). The
@@ -226,8 +240,8 @@ that will never complete. The provider response is closed in a `finally` however
   (default `max_tokens` 512). After a successful call the reservation is replaced with the provider's
   `usage.total_tokens` (replaced, not added to, so completion tokens are never counted twice). That value is only
   trusted if it is a non-negative integer (not `true`, a float or a string); otherwise the estimate stays. It is
-  capped at the limit, which blocks the tenant exactly as a larger number would and keeps it within SQLite's integer
-  range. If every provider fails the reservation is released, so tenants aren't charged for gateway-side failures.
+  stored as reported, even above the budget, so raising `TOKENS_PER_MINUTE` on a restart still counts it; only a
+  count above 10^12 is capped, so a bogus value can't overflow SQLite's 64-bit integers when a window is summed. If every provider fails the reservation is released, so tenants aren't charged for gateway-side failures.
 - Why bytes: the byte-level BPE tokenizers most providers use emit at most one token per UTF-8 byte, so the byte
   count is an upper bound on prompt tokens. A `chars / 4` heuristic is close for English but several times too low
   for Chinese/Japanese text or emoji, and the tenant controls the prompt, so admission could be gamed. With the
@@ -241,13 +255,14 @@ that will never complete. The provider response is closed in a `finally` however
 - Errors: clients get `{"error": {"type", "message", "request_id"}}` with types `authentication_error` (401),
   `invalid_request` (400), `rate_limit_exceeded` (429 + `Retry-After`), `upstream_error` (502),
   `upstream_unavailable` (503), `internal_error` (500). Upstream bodies and exception text go to the logs only.
-- The app closes the router's HTTP client on shutdown.
+- The app closes the router's HTTP client on shutdown, also when startup fails.
 
 ## Known limitations and tradeoffs
 
 - **Not production-ready.** No TLS, no metrics, single-node SQLite, minimal configuration.
 - **Task 1**: data is an in-memory dict, so refunds reset on restart and there is no idempotency key for retried
-  refunds. `CUST-XXXXX` is interpreted as five digits.
+  refunds. `CUST-XXXXX` is interpreted as five digits. Balances are floats (decimal subtraction rounded to the
+  nearest float), so a refund below the balance's precision is rejected rather than recorded.
 - **Task 2**: a shared HMAC secret instead of an identity provider/JWKS; no token revocation. Only POST is proxied,
   so the streamable-HTTP GET (server-initiated SSE) and DELETE (session end) routes aren't. `tools/list` is
   forwarded unfiltered as the task requires, so viewers can see admin tool names; they just can't call them.
@@ -258,7 +273,9 @@ that will never complete. The provider response is closed in a `finally` however
   (`41111111111111115500000000000004`), and cards straddling the boundary of a digit run longer than 48 digits.
   It can over-redact digits next to a card, numbers that happen to look like a dashed SSN or pass Luhn, and
   characters glued to the front of an email (`x=bob@x.com` loses `x=`). Only response text is passed through:
-  clients asking for `logprobs` or tools get none back. The prompt isn't redacted. Assumes OpenAI-style
+  clients asking for `logprobs` or tools get none back. A provider that never sends `finish_reason` or `[DONE]`
+  always ends with an error, and a `finish_reason` newer than the ones listed counts as malformed. The prompt isn't
+  redacted. Assumes OpenAI-style
   single-line `data:` events; the 1,407-char bound is per choice, and the size of a single provider event line
   and the number of choices aren't capped.
 - **Task 4**: the byte estimate is deliberately pessimistic, not a real tokenizer. English prompts reserve about

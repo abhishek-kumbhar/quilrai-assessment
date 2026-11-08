@@ -103,10 +103,9 @@ async def redact_sse_stream(lines: AsyncIterator[str]) -> AsyncIterator[bytes]:
                 chunk = json.loads(payload)
                 choices = checked_choices(chunk, "delta")
             except ValueError as exc:
-                # Fail closed: an event we can't parse may hold text we'd be unable to redact.
+                # Fail closed: an event we can't parse may hold text we'd be unable to redact. The held
+                # tail is dropped too, since it may be the start of a value that will now never complete.
                 logger.error("provider sent a malformed stream event: %s", exc)
-                for event in leftover_events():
-                    yield event
                 yield sse_event({"error": {"type": "upstream_error", "message": "LLM provider sent an invalid event"}})
                 return
 
@@ -123,9 +122,7 @@ async def redact_sse_stream(lines: AsyncIterator[str]) -> AsyncIterator[bytes]:
             yield sse_event({**safe_fields(chunk), "choices": safe_choices})
     except httpx.HTTPError as exc:
         logger.error("provider stream failed: %r", exc)
-        # Held text belongs to an interrupted answer; flush it redacted, then report the error.
-        for event in leftover_events():
-            yield event
+        # As above: the held tail of an interrupted answer is dropped, not flushed.
         yield sse_event({"error": {"type": "upstream_error", "message": "LLM provider stream interrupted"}})
         return
 

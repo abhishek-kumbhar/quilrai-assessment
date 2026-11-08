@@ -209,9 +209,10 @@ The SSE layer forwards an allowlist: per choice only `index`, `finish_reason` an
 redacted `content`, plus top-level `id`/`object`/`created`/`model`/`system_fingerprint`/`usage`. Everything else
 (`logprobs`, tool calls, refusals, audio, unknown fields) is dropped, because it can repeat the generated text in
 a form that isn't redacted; `logprobs` tokens and byte arrays would otherwise spell out a redacted email. The
-non-streaming path applies the same allowlist to `message`. An event that isn't JSON or doesn't have that shape
-ends the stream with a sanitized error event after flushing held text. Held text is flushed on `finish_reason`,
-`[DONE]`, or end of stream, and the provider response is closed in a `finally` however the stream ends.
+non-streaming path applies the same allowlist to `message`. Held text is flushed on `finish_reason`, `[DONE]`, or
+end of stream. An event that isn't JSON or doesn't have that shape, or a broken provider connection, ends the
+stream with a sanitized error event; the held tail is dropped then, because it may be the first half of an email
+that will never complete. The provider response is closed in a `finally` however the stream ends.
 
 **Task 4.**
 - Rate limiter is a sliding log: one SQLite row per request (`tenant`, `tokens`, `created_at`). The

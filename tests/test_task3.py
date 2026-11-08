@@ -473,10 +473,23 @@ async def test_malformed_provider_events_end_the_stream_safely(bad_line):
     events, done = parse_sse(raw)
 
     assert not done
-    # Held text is flushed (redacted on its own), then a sanitized error; nothing after the bad event.
-    assert content_of(events) == "Hi carol@exam"
+    # Text already safe was sent; the held tail ("carol@exam", maybe half an email) is dropped, then a
+    # sanitized error, and nothing after the bad event.
+    assert content_of(events) == "Hi "
     assert events[-1] == STREAM_ERROR
+    assert b"carol" not in raw
     assert b"bob" not in raw
+
+
+async def test_interrupted_provider_stream_drops_the_held_tail():
+    async def broken_provider():
+        yield event_line({"index": 0, "delta": {"content": "Reach me at dave.smith@exam"}})
+        raise httpx.ReadError("connection reset")
+
+    events, done = parse_sse(await collect(redact_sse_stream(broken_provider())))
+    assert not done
+    assert content_of(events) == "Reach me at "
+    assert events[-1] == {"error": {"type": "upstream_error", "message": "LLM provider stream interrupted"}}
 
 
 async def test_malformed_completion_is_a_gateway_error():

@@ -68,9 +68,11 @@ class TokenRateLimiter:
 
     def reserve(self, tenant: str, tokens: int) -> int:
         """Admit a request for `tokens` or raise RateLimitExceeded. Returns a reservation id."""
-        now = self.clock()
-        window_start = now - self.window_seconds
         with self._transaction() as conn:
+            # Read the clock only once the write lock is held; time spent waiting for it
+            # would otherwise make the window boundary and the row's timestamp stale.
+            now = self.clock()
+            window_start = now - self.window_seconds
             conn.execute("DELETE FROM token_usage WHERE created_at <= ?", (window_start,))
             rows = conn.execute(
                 "SELECT tokens, created_at FROM token_usage WHERE tenant = ? ORDER BY created_at",

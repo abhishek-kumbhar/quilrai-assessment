@@ -159,8 +159,10 @@ What they cover, briefly:
   local parts, the documented buffer bound, `logprobs`/refusal/tool-call fields never reaching the client,
   malformed provider events, and the provider response being closed on every exit path.
 - **Task 4**: window boundaries with a fake clock, eviction from disk, persistence across instances, 40 threads and
-  30 concurrent HTTP requests against one budget, fallback on 429/timeout/5xx/network/bad JSON, no fallback on 400,
-  both providers failing, and error payloads that never contain upstream details.
+  30 concurrent HTTP requests against one budget, admission time taken after a held SQLite lock is released,
+  provider usage that is a bool/float/string/negative/huge, fallback on 429/timeout/5xx/network/bad JSON, no
+  fallback on 400, both providers failing, client closed on shutdown, and error payloads that never contain
+  upstream details.
 
 ## Design decisions
 
@@ -215,16 +217,21 @@ ends the stream with a sanitized error event after flushing held text. Held text
 - Rate limiter is a sliding log: one SQLite row per request (`tenant`, `tokens`, `created_at`). The
   check-and-insert runs inside `BEGIN IMMEDIATE`, which takes SQLite's write lock up front, so concurrent requests
   (threads or separate processes on the same file) can't both see the same total and both pass. Rows older than
-  the window are deleted on every reservation. Tenant keys are stored as SHA-256 prefixes.
+  the window are deleted on every reservation. The clock is read after the lock is acquired, so a request that
+  waited for the lock is judged (and stamped) at the time it actually gets in. Tenant keys are stored as SHA-256
+  prefixes.
 - OpenAI-style requests may include `model`; it is accepted but ignored, since the router picks the provider model.
 - Token accounting: before the call the gateway reserves `UTF-8 bytes of the prompt + 4 per message + max_tokens`
   (default `max_tokens` 512). After a successful call the reservation is replaced with the provider's
-  `usage.total_tokens` (replaced, not added to, so completion tokens are never counted twice). If every provider
-  fails the reservation is released, so tenants aren't charged for gateway-side failures.
+  `usage.total_tokens` (replaced, not added to, so completion tokens are never counted twice). That value is only
+  trusted if it is a non-negative integer (not `true`, a float or a string); otherwise the estimate stays. It is
+  capped at the limit, which blocks the tenant exactly as a larger number would and keeps it within SQLite's integer
+  range. If every provider fails the reservation is released, so tenants aren't charged for gateway-side failures.
 - Why bytes: the byte-level BPE tokenizers most providers use emit at most one token per UTF-8 byte, so the byte
   count is an upper bound on prompt tokens. A `chars / 4` heuristic is close for English but several times too low
   for Chinese/Japanese text or emoji, and the tenant controls the prompt, so admission could be gamed. With the
-  byte bound, admission never lets a request in on an underestimate of its prompt.
+  byte bound, a tenant can't get a prompt admitted at a fraction of its real size, as long as the provider's
+  tokenizer is byte-level (see limitations).
 - Fallback: the primary call runs inside `asyncio.timeout(3.0)`, which covers connect, headers and body. httpx's
   own timeouts are per phase, so a slowly trickling response could otherwise run past 3s. When it fires, the
   primary request is cancelled before the secondary is called, so there is no race between a late primary
@@ -233,6 +240,7 @@ ends the stream with a sanitized error event after flushing held text. Held text
 - Errors: clients get `{"error": {"type", "message", "request_id"}}` with types `authentication_error` (401),
   `invalid_request` (400), `rate_limit_exceeded` (429 + `Retry-After`), `upstream_error` (502),
   `upstream_unavailable` (503), `internal_error` (500). Upstream bodies and exception text go to the logs only.
+- The app closes the router's HTTP client on shutdown.
 
 ## Known limitations and tradeoffs
 

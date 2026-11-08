@@ -158,6 +158,34 @@ def test_token_estimate_is_at_least_one_token_per_character_for_cjk():
     assert estimate_tokens(request) >= 100
 
 
+def test_admission_uses_the_time_the_sqlite_lock_was_acquired(db_path):
+    # A request that starts waiting for the write lock at t=159.9 and gets it at t=160.1 must be judged
+    # at 160.1, when the t=100 entry has left the 60s window, and its row must be stamped 160.1.
+    clock = FakeClock(100.0)
+    limiter = TokenRateLimiter(db_path, limit_tokens=100, window_seconds=60, clock=clock)
+    limiter.reserve("t1", 100)
+
+    clock.now = 159.9
+    holder = sqlite3.connect(db_path, isolation_level=None, check_same_thread=False)
+    holder.execute("BEGIN IMMEDIATE")
+
+    def release_lock_later():
+        time.sleep(0.3)
+        clock.now = 160.1
+        holder.execute("COMMIT")
+
+    releaser = threading.Thread(target=release_lock_later)
+    releaser.start()
+    try:
+        limiter.reserve("t1", 50)
+    finally:
+        releaser.join()
+        holder.close()
+
+    with closing(sqlite3.connect(db_path)) as conn:
+        assert conn.execute("SELECT tokens, created_at FROM token_usage").fetchall() == [(50, 160.1)]
+
+
 # ---------- router ----------
 
 
@@ -423,6 +451,57 @@ async def test_missing_reported_usage_keeps_the_estimate(db_path):
     async with client:
         assert await send_sequentially(client, 1) == [200]
     assert limiter.tokens_used(tenant_id(TENANT_KEY)) == 409
+
+
+def provider_reporting(usage):
+    def handler(request):
+        body = {"choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}}]}
+        if usage != "absent":
+            body["usage"] = usage
+        return httpx.Response(200, json=body)
+
+    return handler
+
+
+@pytest.mark.parametrize(
+    "usage, charged",
+    [
+        ({"total_tokens": True}, 409),  # bool is not a count; keep the estimate
+        ({"total_tokens": False}, 409),
+        ({"total_tokens": 12.0}, 409),
+        ({"total_tokens": "12"}, 409),
+        ({"total_tokens": -5}, 409),
+        (["bad"], 409),
+        ("12", 409),
+        (None, 409),
+        ("absent", 409),
+        ({"total_tokens": 2**70}, 1_000),  # capped at the limit: same blocking effect, fits in SQLite
+        ({"total_tokens": 5_000}, 1_000),
+        ({"total_tokens": 0}, 0),
+        ({"total_tokens": 12}, 12),
+    ],
+)
+async def test_reported_usage_is_only_trusted_when_it_is_a_sane_integer(db_path, usage, charged):
+    limiter = TokenRateLimiter(db_path, limit_tokens=1_000)
+    router = ModelRouter(PRIMARY, SECONDARY, httpx.AsyncClient(transport=httpx.MockTransport(provider_reporting(usage))))
+    app = create_app(limiter, router, {TENANT_KEY})
+    async with router.client, httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://gw") as client:
+        response = await client.post("/v1/chat/completions", json={**PAYLOAD, "max_tokens": 400}, headers=AUTH)
+        assert limiter.tokens_used(tenant_id(TENANT_KEY)) == charged
+        # A 10-token request (5 prompt bytes + 4 + 1) fits unless the first one used the whole budget.
+        follow_up = await client.post("/v1/chat/completions", json={**PAYLOAD, "max_tokens": 1}, headers=AUTH)
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "hi"
+    assert follow_up.status_code == (429 if charged == 1_000 else 200)
+
+
+async def test_router_client_is_closed_when_the_app_shuts_down(db_path):
+    router = make_router(ProviderMock())
+    app = create_app(TokenRateLimiter(db_path), router, {TENANT_KEY})
+    async with app.router.lifespan_context(app):
+        assert not router.client.is_closed
+    assert router.client.is_closed
 
 
 async def test_multibyte_prompt_can_be_rejected_even_if_real_tokens_would_fit(db_path):

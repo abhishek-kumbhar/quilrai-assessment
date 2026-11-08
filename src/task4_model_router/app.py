@@ -5,6 +5,7 @@ import hashlib
 import logging
 import math
 import uuid
+from contextlib import asynccontextmanager
 from typing import Literal
 
 from fastapi import FastAPI, Request
@@ -43,6 +44,17 @@ def estimate_tokens(request: CompletionRequest) -> int:
     return prompt_bytes + 4 * len(request.messages) + request.max_tokens
 
 
+def reported_tokens(completion: dict, limit_tokens: int) -> int | None:
+    """The provider's usage.total_tokens if it is usable, else None (the estimate is kept)."""
+    usage = completion.get("usage")
+    total = usage.get("total_tokens") if isinstance(usage, dict) else None
+    if type(total) is not int or total < 0:  # `type(...) is int` rejects bool
+        return None
+    # Any count >= the limit blocks the tenant until this row expires, so capping it changes no
+    # admission decision and keeps the stored value well inside SQLite's integer range.
+    return min(total, limit_tokens)
+
+
 def tenant_id(api_key: str) -> str:
     # Store a hash, not the raw key, in the usage table.
     return hashlib.sha256(api_key.encode()).hexdigest()[:16]
@@ -60,7 +72,14 @@ def validation_message(error: ValidationError) -> str:
 
 def create_app(limiter: TokenRateLimiter, router: ModelRouter, tenant_api_keys: set[str]) -> FastAPI:
     allowed_tenants = {tenant_id(key) for key in tenant_api_keys}
-    app = FastAPI(title="LLM Gateway model router")
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        yield
+        # The app owns the router's HTTP client from here on, as in the other gateways.
+        await router.client.aclose()
+
+    app = FastAPI(title="LLM Gateway model router", lifespan=lifespan)
 
     async def handle_completion(request: Request, request_id: str) -> JSONResponse:
         scheme, _, api_key = request.headers.get("authorization", "").partition(" ")
@@ -95,9 +114,8 @@ def create_app(limiter: TokenRateLimiter, router: ModelRouter, tenant_api_keys: 
                 return gateway_error(503, "upstream_unavailable", "All model providers are currently unavailable", request_id)
             return gateway_error(502, "upstream_error", "Model provider rejected the request", request_id)
 
-        usage = completion.get("usage") or {}
-        actual = usage.get("total_tokens")
-        if isinstance(actual, int) and actual >= 0:
+        actual = reported_tokens(completion, limiter.limit_tokens)
+        if actual is not None:
             await asyncio.to_thread(limiter.settle, reservation, actual)
 
         logger.info("request_id=%s provider=%s estimated=%s actual=%s", request_id, provider, estimated, actual)

@@ -190,6 +190,40 @@ def test_email_after_digits_is_redacted_for_every_two_chunk_split(cut):
     assert stream_through(N01, [N01[:cut], N01[cut:]]) == N01_REDACTED
 
 
+# Runs longer than 48 digits are matched in pieces; a piece must not end inside an SSN, or the SSN's
+# tail is left unmatched. "1234 " * 11 is 44 digits with no Luhn-valid group sequence.
+LONG_RUN = "1234 " * 11
+SSN_AFTER_LONG_RUN = [
+    # 44 + 3 digits: a 48-digit piece would have stopped after "123".
+    (f"IDs {LONG_RUN}123-45-6789 ok", f"IDs {LONG_RUN}[REDACTED] ok"),
+    # 42 + 3 + 2 digits: it would have stopped after "45".
+    ("Call 555 123 4567 " + "1234 " * 8 + "123-45-6789 555 123 4567", "Call 555 123 4567 " + "1234 " * 8 + "[REDACTED] 555 123 4567"),
+    (f"IDs {LONG_RUN}123-45-6789 4321 8765", f"IDs {LONG_RUN}[REDACTED] 4321 8765"),
+    (f"IDs {LONG_RUN}123-45-6789-987-65-4321 ok", f"IDs {LONG_RUN}[REDACTED]-[REDACTED] ok"),
+    # Not SSN-shaped: unchanged.
+    (f"IDs {LONG_RUN}123-4567-89 ok", f"IDs {LONG_RUN}123-4567-89 ok"),
+    (f"IDs {LONG_RUN}1234-56-789 ok", f"IDs {LONG_RUN}1234-56-789 ok"),
+]
+
+
+@pytest.mark.parametrize("text, expected", SSN_AFTER_LONG_RUN)
+def test_ssn_after_a_long_digit_run_is_redacted(text, expected):
+    assert redact_text(text) == expected
+    for size in (1, 2, 3, 7):
+        assert stream_through(text, split_every(text, size)) == expected
+
+
+def test_dash_joined_ssns_are_redacted_with_bounded_buffering():
+    text = "123-45-6789-" * 400
+    redactor = StreamRedactor()
+    emitted = []
+    for chunk in split_every(text, 1):
+        emitted.append(redactor.feed(chunk))
+        assert len(redactor.pending) <= 1501
+    emitted.append(redactor.flush())
+    assert "".join(emitted) == redact_text(text) == "[REDACTED]-" * 400
+
+
 def test_emails_longer_than_the_old_256_char_cap_are_not_released_early():
     # Six 63-digit labels: a 400-char string the email pattern accepts once ".com" arrives.
     email = "bob@" + ".".join(str(digit) * 63 for digit in range(1, 7)) + ".com"

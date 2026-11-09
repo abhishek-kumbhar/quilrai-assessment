@@ -214,10 +214,11 @@ start 703 characters before it, and a digit run ending in that email's first cha
 buffer holds at most 704 + 703 + 94 = 1,501 characters per choice after each chunk. Tests check that streaming
 output is identical to redacting the full text at once, including 2,000 seeded adversarial inputs. Digits are matched
 as whole runs (up to 48 digits) and then checked inside, so a card or SSN next to unrelated digits
-(`4111 1111 1111 1111 12/26`) is still found. Emails and digit runs are searched separately and every part either
-flags is redacted, so a run that ends inside an email (`2024 01 15 12345@example.com`) can't hide it. Email local
-parts accept the RFC 5322 characters (`o'connor`, `a!b`) but must start with a letter or digit, so Markdown around an
-address (`**bob@x.com**`) is kept.
+(`4111 1111 1111 1111 12/26`) is still found. A longer run is matched in pieces that never stop inside a dashed
+SSN, so an SSN at the end of a long run of numbers is still found. Emails and digit runs are searched separately
+and every part either flags is redacted, so a run that ends inside an email (`2024 01 15 12345@example.com`) can't
+hide it. Email local parts accept the RFC 5322 characters (`o'connor`, `a!b`) but must start with a letter or
+digit, so Markdown around an address (`**bob@x.com**`) is kept.
 
 The SSE layer rebuilds each event rather than filtering it. Per choice it keeps `index`, `finish_reason` and a
 `delta` with the redacted `content` (plus `role` if it is `assistant`). At the top level it keeps `id`, `object`,
@@ -276,7 +277,7 @@ complete. The provider response is closed however the stream ends, the same way 
   (`123-45-6789`) and 13-19 digit card numbers (optional single space/dash separators, Luhn-checked). It misses
   SSNs without dashes, obfuscated values (`john at example dot com`), numbers spelled out, PII in other languages
   or scripts, quoted or non-ASCII email local parts, cards glued to other digits with no separator
-  (`41111111111111115500000000000004`), and cards straddling the boundary of a digit run longer than 48 digits.
+  (`41111111111111115500000000000004`), and cards straddling a piece boundary in a digit run longer than 48 digits.
   It can over-redact digits next to a card, numbers that happen to look like a dashed SSN or pass Luhn, and
   characters glued to the front of an email (`x=bob@x.com` loses `x=`). Only response text is passed through:
   clients asking for `logprobs` or tools get none back. A provider that never sends `finish_reason` or `[DONE]`

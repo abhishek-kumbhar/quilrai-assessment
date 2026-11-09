@@ -20,7 +20,15 @@ EMAIL = LOCAL_PART + r"@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z
 SSN = r"(?<![0-9])[0-9]{3}-[0-9]{2}-[0-9]{4}(?![0-9])"
 # A whole run of 13-48 digits with optional single space/dash separators. Matching the
 # full run (not just 13-19 digits) lets sensitive_spans find a card or SSN inside it.
-DIGIT_RUN = r"(?<![0-9])[0-9](?:[ -]?[0-9]){12,47}(?![0-9])"
+# A longer run is matched in pieces, and a piece must not stop inside an SSN ("1234 123|-45-6789"
+# or "123-45|-6789"), or the SSN's tail would be left outside every match. Matching SSNs on their
+# own instead would let SSNs and pieces overlap in a chain, so a dash-joined list of SSNs would
+# be held back in full while streaming.
+NOT_INSIDE_SSN = (
+    r"(?!(?<=(?<![0-9])[0-9]{3})-[0-9]{2}-[0-9]{4}(?![0-9]))"
+    r"(?!(?<=(?<![0-9])[0-9]{3}-[0-9]{2})-[0-9]{4}(?![0-9]))"
+)
+DIGIT_RUN = r"(?<![0-9])[0-9](?:[ -]?[0-9]){12,47}(?![0-9])" + NOT_INSIDE_SSN
 # Emails and numbers are searched separately and their redactions merged. In one alternation the
 # leftmost match wins, so the digit run in "2024 01 15 12345@example.com" would swallow the
 # email's local part; searching emails first instead would hide most of "4111 1111 1111 1111@x.com".

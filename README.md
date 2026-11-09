@@ -1,4 +1,4 @@
-# QuillrAI Solution Architect assessment
+# QuilrAI Solution Architect assessment
 
 Four small, independent components, one per task:
 

@@ -1,5 +1,5 @@
 [project]
-name = "quillrai-assessment"
+name = "quilrai-assessment"
 version = "0.1.0"
 description = "MCP server, MCP security gateway, streaming PII guardrail and LLM model router"
 readme = "README.md"

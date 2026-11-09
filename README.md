@@ -239,7 +239,34 @@ without either is treated as incomplete, the same as a broken connection or a ma
 a sanitized error event and the held tail is dropped, because it may be the first half of an email that will never
 complete. The provider response is closed however the stream ends, the same way as in Task 2.
 
-**Task 4.**
+**Task 4.** One request, from admission to settlement:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant G as Gateway
+    participant DB as SQLite
+    participant P as Primary
+    participant S as Secondary
+    C->>G: POST /v1/chat/completions (Bearer key)
+    G->>DB: reserve estimated tokens
+    alt over budget
+        G-->>C: 429 rate_limit_exceeded + Retry-After
+    else admitted
+        G->>P: completion request (3s deadline)
+        opt 429, timeout, 5xx, network error or invalid response
+            G->>S: same request
+        end
+        alt a provider answered
+            G->>DB: replace the estimate with reported usage.total_tokens
+            G-->>C: 200 + x-gateway-provider
+        else no provider answered
+            G->>DB: release the reservation
+            G-->>C: 503 upstream_unavailable (502 if a provider rejected the request)
+        end
+    end
+```
+
 - Rate limiter is a sliding log: one SQLite row per request (`tenant`, `tokens`, `created_at`). The
   check-and-insert runs inside `BEGIN IMMEDIATE`, which takes SQLite's write lock up front, so concurrent requests
   (threads or separate processes on the same file) can't both see the same total and both pass. Rows older than

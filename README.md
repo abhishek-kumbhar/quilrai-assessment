@@ -18,8 +18,8 @@ FastAPI + uvicorn, Pydantic v2, HTTPX, PyJWT, SQLite (stdlib `sqlite3`), pytest 
 
 ## Setup
 
-Requires [uv](https://docs.astral.sh/uv/getting-started/installation/); `uv sync` installs the dependencies and,
-if none is available, a Python ≥ 3.12.
+Requires [uv](https://docs.astral.sh/uv/getting-started/installation/). `uv sync` installs the dependencies, and
+Python 3.12+ if it isn't already available.
 
 ```bash
 uv sync
@@ -148,27 +148,15 @@ uv run pytest tests/test_task3.py # one task
 
 What they cover, briefly:
 
-- **Task 1**: valid calls, a table of bad customer IDs / amounts / reasons, missing and extra fields, unknown tool,
-  exactly-10-character reasons, sub-cent, successive and too-small refunds, `isError` vs JSON-RPC error, a raw subprocess session asserting every stdout line is JSON-RPC and logs land on
-  stderr, -32700 for unparseable input, and the official SDK client talking to the server.
-- **Task 2**: viewer vs admin, case tricks (`ADMIN_x`), 18 kinds of bad credentials (expired, wrong secret,
-  `alg: none`, forged payload, non-string role, ...), malformed bodies and envelopes (bad id types, non-object
-  params, `result` and `error` together), `NaN`/`Infinity`/`1e999`, batches, duplicate-key smuggling, oversized
-  streamed bodies, downstream down/timeout/broken mid-stream, the client lost while headers or body are sent
-  (disconnect, broken pipe, cancellation), SSE passthrough, and which HTTP
-  client the app closes. Every rejection asserts the downstream received nothing.
-- **Task 3**: detection against hand-written expected outputs (including cards and SSNs next to other digits),
-  streaming output equal to whole-text redaction for many chunk sizes, 200 random chunkings and 2,000 seeded
-  adversarial inputs, PII split at every kind of boundary, long-input speed and bounded buffer, first output
-  emitted before the provider finishes, SSE format preserved, multiple choices, provider errors, RFC 5322 email
-  local parts, the documented buffer bound, `logprobs`/refusals/tool calls/extra metadata/numeric metadata/SSE
-  comments never reaching the client, malformed provider events, streams that end without `finish_reason` or
-  `[DONE]`, and the provider response being closed on every exit path, including the ways a client can be lost.
-- **Task 4**: window boundaries with a fake clock, eviction from disk, persistence across instances, 40 threads and
-  30 concurrent HTTP requests against one budget, admission time taken after a held SQLite lock is released,
-  provider usage that is a bool/float/string/negative/huge or above the budget (also after the budget is raised),
-  fallback on 429/timeout/5xx/network/bad JSON, no fallback on 400, both providers failing, client closed on normal
-  and failed shutdown, and error payloads that never contain upstream details.
+- **Task 1**: schema rejections vs business errors, refund arithmetic, and a real stdio session (stdout is JSON-RPC
+  only), including the official SDK client.
+- **Task 2**: bad credentials and envelopes, viewer vs admin (including case tricks), JSON smuggling (duplicate keys,
+  `NaN`, batches, deep nesting), oversized bodies, downstream failures and lost clients. Every rejection asserts
+  nothing reached the downstream.
+- **Task 3**: exact expected redactions, streaming output equal to whole-text redaction across random and adversarial
+  chunkings, the buffer bound, metadata that could leak PII, and incomplete or malformed provider streams.
+- **Task 4**: window boundaries with a fake clock, concurrent threads and requests against one budget, untrustworthy
+  provider usage, every fallback trigger, and sanitized errors.
 
 ## Design decisions
 
@@ -198,11 +186,9 @@ algorithm list is pinned, so the role can't be self-asserted. Other points:
 - The envelope is checked before anything is forwarded: `jsonrpc` is `"2.0"`, ids are strings or integers,
   `params` is an object, and client responses carry exactly one of `result`/`error`. The 1 MB body limit is
   enforced while reading, so an oversized body is cut off rather than buffered.
-- The downstream response is streamed through and closed however it ends. If it breaks after headers were sent,
-  the client connection is aborted rather than ended as if the body were complete. The close is in a `finally` around
-  the whole response send (a small `StreamingResponse` subclass), not in the body generator, so it also runs when the
-  client is lost before the body starts or a send raises `BrokenPipeError`. A disconnect arrives as cancellation,
-  so the close is shielded from it, and bounded at 5s.
+- The downstream response is streamed through. If it breaks after headers were sent, the client connection is
+  aborted rather than ended as if complete. It is closed however the exchange ends, including when the client
+  disconnects before the body starts, and the close is bounded at 5s.
 - The HTTP client the app creates is closed on shutdown, also when startup fails; an injected one is left to its owner.
 - The caller's `Authorization` header is not forwarded downstream (no token passthrough).
 - HTTP status: 401 for bad credentials, 400 for unparseable/invalid JSON-RPC, 413 for a body over 1 MB, 200 with a
@@ -213,11 +199,10 @@ algorithm list is pinned, so the role can't be self-asserted. Other points:
 of characters that could still become part of a match: email characters, or digits/spaces/dashes for SSNs and
 cards. Everything before that is redacted and sent immediately, so the extra latency is roughly one word. The
 hold-back is capped at 704 characters, the longest string any pattern can match, so text that has been sent can
-never turn out to be the start of a match. The cut never goes through a match: an email crossing the window can
-start 703 characters before it, and a digit run ending in that email's first character 94 before that, so the
-buffer holds at most 704 + 703 + 94 = 1,501 characters per choice after each chunk. Tests check that streaming
-output is identical to redacting the full text at once, including 2,000 seeded adversarial inputs. Digits are matched
-as whole runs (up to 48 digits) and then checked inside, so a card or SSN next to unrelated digits
+never turn out to be the start of a match. The cut never splits a match, so the buffer holds at most 1,501
+characters per choice (derived in `redactor.py`). Tests check that streaming output is identical to redacting the
+full text at once, including 2,000 seeded adversarial inputs. Digits are matched as whole runs (up to 48 digits) and
+then checked inside, so a card or SSN next to unrelated digits
 (`4111 1111 1111 1111 12/26`) is still found. A longer run is matched in pieces that never stop inside a dashed
 SSN, so an SSN at the end of a long run of numbers is still found. Emails and digit runs are searched separately
 and every part either flags is redacted, so a run that ends inside an email (`2024 01 15 12345@example.com`) can't
@@ -278,8 +263,9 @@ sequenceDiagram
   (default `max_tokens` 512). After a successful call the reservation is replaced with the provider's
   `usage.total_tokens` (replaced, not added to, so completion tokens are never counted twice). That value is only
   trusted if it is a non-negative integer (not `true`, a float or a string); otherwise the estimate stays. It is
-  stored as reported, even above the budget, so raising `TOKENS_PER_MINUTE` on a restart still counts it; only a
-  count above 10^12 is capped, so a bogus value can't overflow SQLite's 64-bit integers when a window is summed. If every provider fails the reservation is released, so tenants aren't charged for gateway-side failures.
+  stored as reported, even above the budget; only values above 10^12 are capped, so a bogus count can't overflow
+  SQLite's integer sum. If every provider fails the reservation is released, so tenants aren't charged for
+  gateway-side failures.
 - Why bytes: the byte-level BPE tokenizers most providers use emit at most one token per UTF-8 byte, so the byte
   count is an upper bound on prompt tokens. A `chars / 4` heuristic is close for English but several times too low
   for Chinese/Japanese text or emoji, and the tenant controls the prompt, so admission could be gamed. With the
@@ -297,7 +283,9 @@ sequenceDiagram
 
 ## Known limitations and tradeoffs
 
-- **Not production-ready.** No TLS, no metrics, single-node SQLite, minimal configuration.
+- **Scope.** Built to run locally against the included mocks. A deployment would add TLS termination, metrics and
+  tracing, managed secrets (the Task 2 gateway currently falls back to a built-in dev secret), and a shared store
+  for the Task 4 rate limiter. Per-task gaps are listed below.
 - **Task 1**: data is an in-memory dict, so refunds reset on restart and there is no idempotency key for retried
   refunds. `CUST-XXXXX` is interpreted as five digits. Balances are floats (decimal subtraction rounded to the
   nearest float), so a refund below the balance's precision is rejected rather than recorded.

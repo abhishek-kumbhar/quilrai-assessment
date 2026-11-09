@@ -82,7 +82,7 @@ class ModelRouter:
 
         try:
             completion = response.json()
-        except ValueError:
+        except (ValueError, RecursionError):  # RecursionError: nested deeper than the parser can recurse
             raise UpstreamError(provider.name, "invalid JSON response") from None
         if not isinstance(completion, dict) or not completion.get("choices"):
             raise UpstreamError(provider.name, "response missing choices")

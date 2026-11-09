@@ -37,6 +37,13 @@ FINISH_REASONS = ("stop", "length", "content_filter", "tool_calls", "function_ca
 CLOSE_TIMEOUT_SECONDS = 5
 
 
+def parse_json(data: str | bytes) -> Any:
+    try:
+        return json.loads(data)
+    except RecursionError:  # nested deeper than the parser can recurse
+        raise ValueError("JSON is nested too deeply") from None
+
+
 def sse_event(payload: dict | str) -> bytes:
     data = payload if isinstance(payload, str) else json.dumps(payload)
     return f"data: {data}\n\n".encode()
@@ -143,7 +150,7 @@ async def redact_sse_stream(lines: AsyncIterator[str]) -> AsyncIterator[bytes]:
                 return
 
             try:
-                chunk = json.loads(payload)
+                chunk = parse_json(payload)
                 choices = checked_choices(chunk, "delta")
             except ValueError as exc:
                 # Fail closed: an event we can't parse may hold text we'd be unable to redact. The held
@@ -194,7 +201,7 @@ def create_app(provider_url: str, http_client: httpx.AsyncClient | None = None) 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
         try:
-            body = await request.json()
+            body = parse_json(await request.body())
         except ValueError:
             return gateway_error(400, "invalid_request", "Request body must be valid JSON")
         if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
@@ -203,7 +210,9 @@ def create_app(provider_url: str, http_client: httpx.AsyncClient | None = None) 
         stream = body.get("stream") is True
         try:
             upstream_request = client.build_request("POST", provider_url, json=body)
-        except ValueError:  # NaN/Infinity (or 1e999): Python's parser accepts them, httpx won't send them
+        # NaN/Infinity (or 1e999): Python's parser accepts them, httpx won't send them. Nesting that
+        # parsed can still be too deep for httpx to re-encode (seen on Python 3.12).
+        except (ValueError, RecursionError):
             return gateway_error(400, "invalid_request", "Request body must be valid JSON")
         try:
             upstream = await client.send(upstream_request, stream=True)
@@ -218,7 +227,7 @@ def create_app(provider_url: str, http_client: httpx.AsyncClient | None = None) 
 
         if not stream:
             try:
-                completion = json.loads(await upstream.aread())
+                completion = parse_json(await upstream.aread())
                 choices = checked_choices(completion, "message")
             except (ValueError, httpx.HTTPError):
                 return gateway_error(502, "upstream_error", "LLM provider returned an invalid response")

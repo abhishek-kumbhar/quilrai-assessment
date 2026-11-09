@@ -180,6 +180,10 @@ async def test_bearer_scheme_is_case_insensitive(client):
         (b'{"jsonrpc": "2.0", "id": 1, "method": 5}', 400, -32600),
         (b'{"jsonrpc": "2.0", "id": 1, "method": "tools/call"}', 200, -32602),
         (b'{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": 5}}', 200, -32602),
+        # Nested deeper than Python's parser can recurse (it raises RecursionError, not ValueError).
+        pytest.param(b"[" * 100_000 + b"]" * 100_000, 400, -32700, id="too-deep-array"),
+        pytest.param(b'{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"x": ' + b"[" * 100_000 + b"]" * 100_000 + b"}}",
+                     400, -32700, id="too-deep-params"),
     ],
 )
 async def test_malformed_requests(client, downstream, body, status, code):

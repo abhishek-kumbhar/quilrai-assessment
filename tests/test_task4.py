@@ -216,6 +216,8 @@ class ProviderMock:
             return httpx.Response(400, json={"error": "bad request"})
         if behavior == "bad_json":
             return httpx.Response(200, text="<html>oops</html>")
+        if behavior == "too_deep":  # parsing raises RecursionError rather than ValueError
+            return httpx.Response(200, text="[" * 100_000 + "]" * 100_000)
         if behavior == "slow":
             await asyncio.sleep(self.slow_seconds)
             return httpx.Response(200, json=completion("too late", self.total_tokens))
@@ -236,7 +238,7 @@ async def test_primary_success_does_not_touch_secondary():
     assert mock.calls == ["primary"]
 
 
-@pytest.mark.parametrize("failure", ["429", "slow", "500", "connect_error", "bad_json"])
+@pytest.mark.parametrize("failure", ["429", "slow", "500", "connect_error", "bad_json", "too_deep"])
 async def test_falls_back_to_secondary(failure):
     mock = ProviderMock(primary=failure)
     started = time.perf_counter()
@@ -564,6 +566,20 @@ async def test_upstream_failures_are_sanitized_and_not_charged(db_path):
     for leaked in ["Traceback", "hunter2", "primary.test", "secondary.test", "500"]:
         assert leaked not in response.json()["error"]["message"]
     assert limiter.tokens_used(tenant_id(TENANT_KEY)) == 0
+
+
+@pytest.mark.parametrize("secondary, status, provider, used", [("ok", 200, "secondary", 42), ("too_deep", 503, None, 0)])
+async def test_too_deeply_nested_provider_json_falls_back_and_is_accounted(db_path, secondary, status, provider, used):
+    client, limiter = gateway(db_path, ProviderMock(primary="too_deep", secondary=secondary))
+    async with client:
+        response = await client.post("/v1/chat/completions", json=PAYLOAD, headers=AUTH)
+
+    assert response.status_code == status
+    assert response.headers.get("x-gateway-provider") == provider
+    if status == 503:
+        assert_gateway_error(response, 503, "upstream_unavailable")
+    # Settled to the secondary's reported usage, or released when no provider answered.
+    assert limiter.tokens_used(tenant_id(TENANT_KEY)) == used
 
 
 async def test_provider_rejection_maps_to_502(db_path):

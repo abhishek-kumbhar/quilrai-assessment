@@ -404,12 +404,18 @@ async def test_provider_errors_are_sanitized():
     assert "10.0.0.5" not in response.text
 
 
+TOO_DEEP = "[" * 100_000 + "]" * 100_000  # Python's parser raises RecursionError, not ValueError
+
+
 async def test_invalid_requests_are_rejected():
     async with gateway_client(provider_transport([])) as client:
         bad_json = await client.post("/v1/chat/completions", content=b"{nope")
         no_messages = await client.post("/v1/chat/completions", json={"model": "m"})
+        too_deep = await client.post("/v1/chat/completions", content='{"messages": [], "x": ' + TOO_DEEP + "}")
     assert bad_json.status_code == 400
     assert no_messages.status_code == 400
+    assert too_deep.status_code == 400
+    assert too_deep.json() == {"error": {"type": "invalid_request", "message": "Request body must be valid JSON"}}
 
 
 @pytest.mark.parametrize("number", [b"NaN", b"Infinity", b"-Infinity", b"1e999"])
@@ -534,6 +540,16 @@ async def test_malformed_provider_events_end_the_stream_safely(bad_line):
     assert b"bob" not in raw
 
 
+async def test_too_deeply_nested_stream_event_ends_the_stream_safely():
+    lines = [event_line({"index": 0, "delta": {"content": "Hi bob@exa"}, "finish_reason": None}),
+             f"data: {{\"choices\": [], \"x\": {TOO_DEEP}}}", "data: [DONE]"]
+    async with gateway_client(raw_provider(lines)) as client:
+        response = await client.post("/v1/chat/completions", json=REQUEST)
+    events, done = parse_sse(response.content)
+    assert events == [{"id": "c1", "model": "m", "choices": [{"index": 0, "delta": {"content": "Hi "}, "finish_reason": None}]}, STREAM_ERROR]
+    assert not done
+
+
 async def test_interrupted_provider_stream_drops_the_held_tail():
     async def broken_provider():
         yield event_line({"index": 0, "delta": {"content": "Reach me at dave.smith@exam"}})
@@ -552,6 +568,16 @@ async def test_malformed_completion_is_a_gateway_error():
             response = await client.post("/v1/chat/completions", json={**REQUEST, "stream": False})
         assert response.status_code == 502
         assert response.json() == {"error": {"type": "upstream_error", "message": "LLM provider returned an invalid response"}}
+
+
+async def test_too_deeply_nested_completion_is_a_gateway_error_and_is_closed():
+    stream = TrackedStream(['{"choices": [], "x": ' + TOO_DEEP + "}"])
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, stream=stream))
+    async with gateway_client(transport) as client:
+        response = await client.post("/v1/chat/completions", json={**REQUEST, "stream": False})
+    assert response.status_code == 502
+    assert response.json() == {"error": {"type": "upstream_error", "message": "LLM provider returned an invalid response"}}
+    assert stream.closed
 
 
 class TrackedStream(httpx.AsyncByteStream):
@@ -574,6 +600,7 @@ class TrackedStream(httpx.AsyncByteStream):
         (sse_lines(["fine"]), None),
         (["data: null"], None),
         (sse_lines(["half"])[:2], httpx.ReadError("reset")),
+        ([f"data: {{\"choices\": [], \"x\": {TOO_DEEP}}}"], None),
     ],
 )
 async def test_provider_response_is_closed_however_the_stream_ends(lines, error):

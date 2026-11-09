@@ -50,7 +50,10 @@ def finite_float(text: str) -> float:
 
 def parse_json(body: bytes) -> Any:
     # Python's json module accepts NaN/Infinity by default; RFC 8259 JSON doesn't.
-    return json.loads(body, parse_constant=reject_constant, parse_float=finite_float)
+    try:
+        return json.loads(body, parse_constant=reject_constant, parse_float=finite_float)
+    except RecursionError:  # nested deeper than the parser can recurse
+        raise ValueError("JSON is nested too deeply") from None
 
 
 def is_valid_id(value: Any) -> bool:

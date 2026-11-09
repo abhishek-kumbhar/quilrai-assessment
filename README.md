@@ -18,6 +18,9 @@ FastAPI + uvicorn, Pydantic v2, HTTPX, PyJWT, SQLite (stdlib `sqlite3`), pytest 
 
 ## Setup
 
+Requires [uv](https://docs.astral.sh/uv/getting-started/installation/); `uv sync` installs the dependencies and,
+if none is available, a Python ≥ 3.12.
+
 ```bash
 uv sync
 uv run pytest
@@ -202,8 +205,9 @@ algorithm list is pinned, so the role can't be self-asserted. Other points:
   so the close is shielded from it, and bounded at 5s.
 - The HTTP client the app creates is closed on shutdown, also when startup fails; an injected one is left to its owner.
 - The caller's `Authorization` header is not forwarded downstream (no token passthrough).
-- HTTP status: 401 for bad credentials, 400 for unparseable/invalid JSON-RPC, 200 with a JSON-RPC error for
-  `-32001`/`-32602` (so MCP clients match it to the request id), 502/504 if the downstream is unreachable.
+- HTTP status: 401 for bad credentials, 400 for unparseable/invalid JSON-RPC, 413 for a body over 1 MB, 200 with a
+  JSON-RPC error for `-32001`/`-32602` (so MCP clients match it to the request id), 502/504 if the downstream is
+  unreachable.
 
 **Task 3.** `StreamRedactor` keeps a small pending buffer. After each chunk it holds back only the trailing run
 of characters that could still become part of a match: email characters, or digits/spaces/dashes for SSNs and

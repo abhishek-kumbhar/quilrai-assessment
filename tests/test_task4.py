@@ -8,7 +8,14 @@ from contextlib import closing
 import httpx
 import pytest
 
-from task4_model_router.app import MAX_REPORTED_TOKENS, CompletionRequest, create_app, estimate_tokens, reported_tokens, tenant_id
+from task4_model_router.app import (
+    MAX_REPORTED_TOKENS,
+    CompletionRequest,
+    create_app,
+    estimate_tokens,
+    reported_tokens,
+    tenant_id,
+)
 from task4_model_router.mock_providers import create_provider_app
 from task4_model_router.rate_limiter import RateLimitExceeded, TokenRateLimiter
 from task4_model_router.router import ModelRouter, Provider, UpstreamError
@@ -233,7 +240,7 @@ def make_router(mock, primary_timeout=0.2, secondary_timeout=0.5):
 
 async def test_primary_success_does_not_touch_secondary():
     mock = ProviderMock()
-    result, provider = await make_router(mock).complete(PAYLOAD)
+    _, provider = await make_router(mock).complete(PAYLOAD)
     assert provider == "primary"
     assert mock.calls == ["primary"]
 
